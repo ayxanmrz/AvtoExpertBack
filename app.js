@@ -8,8 +8,8 @@ const PORT = 4000;
 const app = express();
 const cache = new NodeCache({ stdTTL: 300 });
 
-let EURO_AZN = 1.8;
-let USD_AZN = 1.7;
+let EURO_AZN;
+let USD_AZN;
 
 app.use(cors());
 
