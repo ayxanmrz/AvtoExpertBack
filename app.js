@@ -34,7 +34,7 @@ async function getPage() {
   return page;
 }
 
-async function getRandomCars() {
+async function getRandomCars(numberOfCars) {
   const page = await getPage();
   try {
     await page.goto(
@@ -44,7 +44,7 @@ async function getRandomCars() {
       }
     );
 
-    return await page.evaluate(() => {
+    return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
       const sampleSize = (arr, n = 1) => shuffle(arr).slice(0, n);
 
@@ -52,8 +52,8 @@ async function getRandomCars() {
         (elem) => elem.querySelector(".products-i__link")?.href
       );
 
-      return sampleSize(carDatas, Math.min(carDatas.length, 20));
-    });
+      return sampleSize(carDatas, Math.min(carDatas.length, numberOfCars));
+    }, numberOfCars);
   } catch (error) {
     console.error("Error fetching random cars:", error);
     return [];
@@ -162,7 +162,8 @@ app.get("/get-random-cars", async (req, res) => {
   // }
 
   try {
-    let cars = await getRandomCars();
+    let numberOfCars = req.query.number || 20;
+    let cars = await getRandomCars(numberOfCars);
     let carInfos = await Promise.all(cars.map(getCarInfo));
 
     cache.set("randomCars", carInfos);
@@ -177,8 +178,6 @@ app.listen(PORT, async () => {
   await launchBrowser();
   await getEuroConverts();
   await getUsdConverts();
-  console.log(EURO_AZN);
-  console.log(USD_AZN);
   console.log(
     `[SERVER] ExpressJS is listening to port http://localhost:${PORT}`
   );
