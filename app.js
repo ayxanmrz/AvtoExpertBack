@@ -29,6 +29,7 @@ async function launchBrowser() {
         process.env.NODE_ENV === "production"
           ? process.env.PUPPETEER_EXECUTABLE_PATH
           : getExecutablePath(),
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
   }
 }
