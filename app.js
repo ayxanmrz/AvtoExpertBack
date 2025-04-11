@@ -1,4 +1,4 @@
-import puppeteer, { executablePath } from "puppeteer";
+import puppeteer, { executablePath as getExecutablePath } from "puppeteer";
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
@@ -28,7 +28,7 @@ async function launchBrowser() {
       executablePath:
         process.env.NODE_ENV === "production"
           ? process.env.PUPPETEER_EXECUTABLE_PATH
-          : executablePath,
+          : getExecutablePath(),
     });
   }
 }
