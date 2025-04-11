@@ -24,7 +24,7 @@ let browser;
 async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
-      headless: "new",
+      headless: "false",
       executablePath:
         process.env.NODE_ENV === "production"
           ? process.env.PUPPETEER_EXECUTABLE_PATH
@@ -56,6 +56,7 @@ async function getRandomCars(numberOfCars) {
         waitUntil: "domcontentloaded",
       }
     );
+    await page.waitForSelector(".products-i", { timeout: 5000 });
 
     return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
