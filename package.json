@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node app.js",
-    "postinstall": "puppeteer install"
+    "postinstall": "node node_modules/puppeteer/install.js"
   },
   "author": "",
   "license": "ISC",
