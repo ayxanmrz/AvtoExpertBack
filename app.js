@@ -25,7 +25,10 @@ async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
       headless: "new",
-      executablePath: getExecutablePath(),
+      executablePath:
+        process.env.NODE_ENV === "production"
+          ? process.env.PUPPETEER_EXECUTABLE_PATH
+          : getExecutablePath(),
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
   }
@@ -53,7 +56,7 @@ async function getRandomCars(numberOfCars) {
         waitUntil: "domcontentloaded",
       }
     );
-    await page.waitForSelector(".products-i", { timeout: 5000 });
+    await page.waitForSelector(".products-i");
 
     return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
