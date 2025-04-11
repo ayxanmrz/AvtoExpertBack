@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
+import dotenv from "dotenv";
+dotenv.config();
 
 const PORT = 4000;
 const app = express();
@@ -11,7 +13,11 @@ const cache = new NodeCache({ stdTTL: 300 });
 let EURO_AZN;
 let USD_AZN;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
+  })
+);
 
 let browser;
 
