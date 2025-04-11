@@ -1,10 +1,14 @@
-import puppeteer, { executablePath as getExecutablePath } from "puppeteer";
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import { executablePath as getExecutablePath } from "puppeteer";
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
+
+puppeteer.use(StealthPlugin());
 
 const PORT = 4000;
 const app = express();
@@ -24,10 +28,10 @@ let browser;
 async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
-      headless: "new",
+      headless: "new", // use true if "new" causes issues
       executablePath:
         process.env.NODE_ENV === "production"
-          ? process.env.PUPPETEER_EXECUTABLE_PATH
+          ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome"
           : getExecutablePath(),
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
@@ -36,6 +40,11 @@ async function launchBrowser() {
 
 async function getPage() {
   const page = await browser.newPage();
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+  );
+  await page.setJavaScriptEnabled(true);
+
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     if (["image", "stylesheet", "font"].includes(req.resourceType())) {
@@ -44,6 +53,7 @@ async function getPage() {
       req.continue();
     }
   });
+
   return page;
 }
 
