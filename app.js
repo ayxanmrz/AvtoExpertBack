@@ -1,4 +1,4 @@
-import puppeteer from "puppeteer";
+import puppeteer, { executablePath } from "puppeteer";
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
@@ -23,7 +23,13 @@ let browser;
 
 async function launchBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({ headless: "new" });
+    browser = await puppeteer.launch({
+      headless: "new",
+      executablePath:
+        process.env.NODE_ENV === "production"
+          ? process.env.PUPPETEER_EXECUTABLE_PATH
+          : executablePath,
+    });
   }
 }
 
