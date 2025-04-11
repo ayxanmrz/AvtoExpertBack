@@ -24,11 +24,8 @@ let browser;
 async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
-      headless: "false",
-      executablePath:
-        process.env.NODE_ENV === "production"
-          ? process.env.PUPPETEER_EXECUTABLE_PATH
-          : getExecutablePath(),
+      headless: "new",
+      executablePath: getExecutablePath(),
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
   }
