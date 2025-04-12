@@ -28,7 +28,7 @@ let browser;
 async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
-      headless: "new", // use true if "new" causes issues
+      headless: false, // use true if "new" causes issues
       executablePath:
         process.env.NODE_ENV === "production"
           ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome"
@@ -41,8 +41,12 @@ async function launchBrowser() {
 async function getPage() {
   const page = await browser.newPage();
   await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "en-US,en;q=0.9",
+  });
+
   await page.setJavaScriptEnabled(true);
 
   await page.setRequestInterception(true);
