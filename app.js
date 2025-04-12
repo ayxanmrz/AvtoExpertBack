@@ -28,12 +28,19 @@ let browser;
 async function launchBrowser() {
   if (!browser) {
     browser = await puppeteer.launch({
-      headless: false, // use true if "new" causes issues
+      headless: "new", // use true if "new" causes issues
       executablePath:
         process.env.NODE_ENV === "production"
           ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome"
           : getExecutablePath(),
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+        "--no-zygote",
+      ],
     });
   }
 }
