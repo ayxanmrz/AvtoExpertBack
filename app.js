@@ -60,13 +60,19 @@ async function getPage() {
 async function getRandomCars(numberOfCars) {
   const page = await getPage();
   try {
-    await page.goto(
-      "https://turbo.az/autos?pages=" + (Math.floor(Math.random() * 20) + 1),
-      {
-        waitUntil: "domcontentloaded",
-      }
-    );
-    await page.waitForSelector(".products-i");
+    const pageNumber = Math.floor(Math.random() * 20) + 1;
+    const url = `https://turbo.az/autos?page=${pageNumber}`;
+
+    console.log("[INFO] Navigating to:", url);
+    await page.goto(url, {
+      waitUntil: "networkidle2", // More reliable than domcontentloaded
+      timeout: 60000, // optional
+    });
+
+    const html = await page.content();
+    console.log(html);
+
+    await page.waitForSelector(".products-i", { timeout: 10000 });
 
     return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
@@ -79,7 +85,7 @@ async function getRandomCars(numberOfCars) {
       return sampleSize(carDatas, Math.min(carDatas.length, numberOfCars));
     }, numberOfCars);
   } catch (error) {
-    console.error("Error fetching random cars:", error);
+    console.error("[ERROR] Failed on getRandomCars:", error);
     return [];
   } finally {
     await page.close();
