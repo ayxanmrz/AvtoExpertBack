@@ -80,10 +80,7 @@ async function getRandomCars(numberOfCars) {
       timeout: 60000, // optional
     });
 
-    const html = await page.content();
-    console.log(html);
-
-    await page.waitForSelector(".products-i", { timeout: 10000 });
+    await page.waitForSelector(".products-i");
 
     return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
