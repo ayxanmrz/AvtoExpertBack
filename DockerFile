@@ -1,13 +1,8 @@
+
 FROM node:20-slim
 
-RUN apt-get update && apt-get install -y wget gnupg ca-certificates
-
-# Add Google’s signing key and repo
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-RUN echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-
 RUN apt-get update && apt-get install -y \
-    google-chrome-stable \
+    ca-certificates \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -23,16 +18,30 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils \
-    --no-install-recommends \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    wget \
+    --no-install-recommends && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-
+# Set working directory
 WORKDIR /usr/src/app
 
+# Copy package files and install dependencies
 COPY package*.json ./
-RUN npm ci
+RUN npm install
+
+# Copy the rest of your application
 COPY . .
 
-CMD [ "node", "app.js" ]
+# Ensure Puppeteer uses the bundled Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Puppeteer will install its own Chromium version
+RUN npm install puppeteer
+
+# Expose the port used by your app
+EXPOSE 4000
+
+# Start the server
+CMD ["node", "app.js"]

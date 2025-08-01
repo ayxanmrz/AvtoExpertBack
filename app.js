@@ -1,14 +1,10 @@
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import { executablePath as getExecutablePath } from "puppeteer";
+import puppeteer from "puppeteer";
 import express from "express";
 import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
-
-puppeteer.use(StealthPlugin());
 
 const PORT = 4000;
 const app = express();
@@ -17,6 +13,7 @@ const cache = new NodeCache({ stdTTL: 300 });
 let EURO_AZN;
 let USD_AZN;
 
+app.use(cors());
 app.use(
   cors({
     origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
@@ -27,35 +24,12 @@ let browser;
 
 async function launchBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({
-      headless: "new", // use true if "new" causes issues
-      executablePath:
-        process.env.NODE_ENV === "production"
-          ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome"
-          : getExecutablePath(),
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-        "--no-zygote",
-      ],
-    });
+    browser = await puppeteer.launch({ headless: "new" });
   }
 }
 
 async function getPage() {
   const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  );
-  await page.setExtraHTTPHeaders({
-    "Accept-Language": "en-US,en;q=0.9",
-  });
-
-  await page.setJavaScriptEnabled(true);
-
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     if (["image", "stylesheet", "font"].includes(req.resourceType())) {
@@ -64,23 +38,18 @@ async function getPage() {
       req.continue();
     }
   });
-
   return page;
 }
 
 async function getRandomCars(numberOfCars) {
   const page = await getPage();
   try {
-    const pageNumber = Math.floor(Math.random() * 20) + 1;
-    const url = `https://turbo.az/autos?page=${pageNumber}`;
-
-    console.log("[INFO] Navigating to:", url);
-    await page.goto(url, {
-      waitUntil: "networkidle2", // More reliable than domcontentloaded
-      timeout: 60000, // optional
-    });
-
-    await page.waitForSelector(".products-i");
+    await page.goto(
+      "https://turbo.az/autos?pages=" + (Math.floor(Math.random() * 20) + 1),
+      {
+        waitUntil: "domcontentloaded",
+      }
+    );
 
     return await page.evaluate((numberOfCars) => {
       const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
@@ -93,7 +62,7 @@ async function getRandomCars(numberOfCars) {
       return sampleSize(carDatas, Math.min(carDatas.length, numberOfCars));
     }, numberOfCars);
   } catch (error) {
-    console.error("[ERROR] Failed on getRandomCars:", error);
+    console.error("Error fetching random cars:", error);
     return [];
   } finally {
     await page.close();
@@ -224,22 +193,3 @@ app.listen(PORT, async () => {
 process.on("exit", async () => {
   if (browser) await browser.close();
 });
-
-// const getManatPrice = (string) => {
-//   const stringList = string.spl it(" ");
-//   const currency = stringList[stringList - 1];
-//   const value = stringList
-//     .slice(0, stringList.length - 1)
-//     .reduce((res, elem) => res + elem);
-//   console.log(currency);
-//   console.log(value);
-//   if (currency === "AZN") {
-//     return +value;
-//   } else if (currency === "USD") {
-//     return value * 1.7;
-//   } else {
-//     return null;
-//   }
-// };
-
-// console.log(getManatPrice("18 000 USD"));
