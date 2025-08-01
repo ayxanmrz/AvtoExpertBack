@@ -63,12 +63,13 @@ app.use(
 // Enhanced browser launch with retry logic and multiple fallback paths
 async function launchBrowser() {
   const chromiumPaths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-  ].filter(Boolean);
+    null, // Let Puppeteer find its own browser
+  ].filter((path) => path !== undefined);
 
   if (browser && !browser.disconnected) {
     Logger.info("Browser already running");
@@ -84,9 +85,8 @@ async function launchBrowser() {
       try {
         Logger.info(`Trying to launch browser with path: ${executablePath}`);
 
-        browser = await puppeteer.launch({
+        const launchOptions = {
           headless: "new",
-          executablePath,
           args: [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -98,9 +98,19 @@ async function launchBrowser() {
             "--no-default-browser-check",
             "--disable-default-apps",
             "--disable-extensions",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
           ],
           timeout: 30000, // 30 second timeout
-        });
+        };
+
+        // Only set executablePath if it's not null (let Puppeteer auto-detect if null)
+        if (executablePath) {
+          launchOptions.executablePath = executablePath;
+        }
+
+        browser = await puppeteer.launch(launchOptions);
 
         Logger.info(
           `Browser launched successfully with path: ${executablePath}`
