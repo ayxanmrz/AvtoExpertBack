@@ -4,23 +4,53 @@ import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
 import dotenv from "dotenv";
+import cluster from "cluster";
+import os from "os";
+
 dotenv.config();
 
 const PORT = 4000;
 const app = express();
-const cache = new NodeCache({ stdTTL: 300 });
 
-let EURO_AZN = 1.8; // Default fallback values
+// Enhanced cache with longer TTL and more aggressive caching
+const cache = new NodeCache({
+  stdTTL: 1800, // 30 minutes
+  checkperiod: 120, // Check for expired keys every 2 minutes
+  useClones: false, // Avoid deep cloning for better performance
+  maxKeys: 1000, // Limit memory usage
+});
+
+// Performance optimized cache for exchange rates
+const exchangeRateCache = new NodeCache({
+  stdTTL: 3600, // 1 hour for exchange rates
+  maxKeys: 10,
+});
+
+let EURO_AZN = 1.8;
 let USD_AZN = 1.7;
-let browser;
-let browserLaunchAttempts = 0;
-const MAX_BROWSER_LAUNCH_ATTEMPTS = 3;
-const BROWSER_RETRY_DELAY = 5000; // 5 seconds
+let browserPool = [];
+const MAX_BROWSER_INSTANCES = Math.min(os.cpus().length, 3); // Limit based on CPU cores
+const MAX_PAGES_PER_BROWSER = 10;
+let currentBrowserIndex = 0;
 
-// Enhanced logging utility
+// Connection pool for HTTP requests
+const axiosInstance = axios.create({
+  timeout: 5000,
+  maxRedirects: 3,
+  headers: {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+  },
+});
+
+// Enhanced logging with performance tracking
 class Logger {
   static info(message, data = null) {
-    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, data || "");
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `[INFO] ${new Date().toISOString()} - ${message}`,
+        data || ""
+      );
+    }
   }
 
   static error(message, error = null) {
@@ -33,333 +63,405 @@ class Logger {
   static warn(message, data = null) {
     console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, data || "");
   }
-}
 
-// Custom error classes
-class BrowserLaunchError extends Error {
-  constructor(message, originalError) {
-    super(message);
-    this.name = "BrowserLaunchError";
-    this.originalError = originalError;
+  static perf(operation, duration) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[PERF] ${operation}: ${duration}ms`);
+    }
   }
 }
 
-class PageProcessingError extends Error {
-  constructor(message, url, originalError) {
-    super(message);
-    this.name = "PageProcessingError";
-    this.url = url;
-    this.originalError = originalError;
-  }
-}
+// Performance monitoring middleware
+app.use((req, res, next) => {
+  req.startTime = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - req.startTime;
+    if (duration > 1000) {
+      // Log slow requests
+      Logger.warn(`Slow request: ${req.method} ${req.path} took ${duration}ms`);
+    }
+  });
+  next();
+});
 
-app.use(cors());
 app.use(
   cors({
     origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
+    credentials: true,
   })
 );
 
-// Enhanced browser launch with retry logic and multiple fallback paths
-async function launchBrowser() {
-  const chromiumPaths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    null, // Let Puppeteer find its own browser
-  ].filter((path) => path !== undefined);
+// Optimized browser launch with better resource management
+async function launchOptimizedBrowser() {
+  const launchOptions = {
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-web-security",
+      "--disable-features=VizDisplayCompositor",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-ipc-flooding-protection",
+      "--disable-hang-monitor",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--no-zygote",
+      "--single-process", // Use single process for better resource control
+      "--memory-pressure-off",
+      "--max_old_space_size=4096",
+    ],
+    timeout: 15000,
+    protocolTimeout: 15000,
+    ignoreHTTPSErrors: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+  };
 
-  if (browser && !browser.disconnected) {
-    Logger.info("Browser already running");
-    return browser;
-  }
+  const browser = await puppeteer.launch(launchOptions);
 
-  for (let attempt = 1; attempt <= MAX_BROWSER_LAUNCH_ATTEMPTS; attempt++) {
-    Logger.info(
-      `Browser launch attempt ${attempt}/${MAX_BROWSER_LAUNCH_ATTEMPTS}`
-    );
+  // Pre-warm browser with a page
+  const warmupPage = await browser.newPage();
+  await warmupPage.goto("data:text/html,<html></html>", {
+    waitUntil: "domcontentloaded",
+  });
+  await warmupPage.close();
 
-    for (const executablePath of chromiumPaths) {
-      try {
-        Logger.info(`Trying to launch browser with path: ${executablePath}`);
-
-        const launchOptions = {
-          headless: "new",
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-web-security",
-            "--disable-features=VizDisplayCompositor",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-default-apps",
-            "--disable-extensions",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-          ],
-          timeout: 30000, // 30 second timeout
-        };
-
-        // Only set executablePath if it's not null (let Puppeteer auto-detect if null)
-        if (executablePath) {
-          launchOptions.executablePath = executablePath;
-        }
-
-        browser = await puppeteer.launch(launchOptions);
-
-        Logger.info(
-          `Browser launched successfully with path: ${executablePath}`
-        );
-        browserLaunchAttempts = 0; // Reset counter on success
-
-        // Test browser functionality
-        const testPage = await browser.newPage();
-        await testPage.goto("data:text/html,<h1>Test</h1>", {
-          waitUntil: "domcontentloaded",
-        });
-        await testPage.close();
-        Logger.info("Browser functionality test passed");
-
-        return browser;
-      } catch (error) {
-        Logger.error(
-          `Failed to launch browser with path ${executablePath}:`,
-          error.message
-        );
-        if (browser) {
-          try {
-            await browser.close();
-          } catch (closeError) {
-            Logger.error(
-              "Error closing browser after failed launch:",
-              closeError.message
-            );
-          }
-          browser = null;
-        }
-      }
-    }
-
-    if (attempt < MAX_BROWSER_LAUNCH_ATTEMPTS) {
-      Logger.info(`Waiting ${BROWSER_RETRY_DELAY}ms before next attempt...`);
-      await new Promise((resolve) => setTimeout(resolve, BROWSER_RETRY_DELAY));
-    }
-  }
-
-  browserLaunchAttempts++;
-  const errorMsg = `Failed to launch browser after ${MAX_BROWSER_LAUNCH_ATTEMPTS} attempts with all available paths`;
-  Logger.error(errorMsg);
-  throw new BrowserLaunchError(errorMsg, null);
+  return browser;
 }
 
-// Enhanced page creation with error handling
-async function getPage() {
+// Browser pool management
+async function initializeBrowserPool() {
+  const startTime = Date.now();
+  Logger.info(
+    `Initializing browser pool with ${MAX_BROWSER_INSTANCES} instances`
+  );
+
   try {
-    if (!browser || browser.disconnected) {
-      Logger.warn("Browser not available, attempting to launch...");
-      await launchBrowser();
-    }
+    const browsers = await Promise.all(
+      Array(MAX_BROWSER_INSTANCES)
+        .fill()
+        .map(() => launchOptimizedBrowser())
+    );
 
-    const page = await browser.newPage();
+    browserPool = browsers.map((browser) => ({
+      browser,
+      activePagesCount: 0,
+      lastUsed: Date.now(),
+    }));
 
-    // Set timeouts
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(30000);
-
-    // Request interception with error handling
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      try {
-        if (["image", "stylesheet", "font"].includes(req.resourceType())) {
-          req.abort();
-        } else {
-          req.continue();
-        }
-      } catch (error) {
-        Logger.error("Request interception error:", error.message);
-      }
-    });
-
-    // Error event handlers
-    page.on("error", (error) => {
-      Logger.error("Page error:", error.message);
-    });
-
-    page.on("pageerror", (error) => {
-      Logger.error("Page script error:", error.message);
-    });
-
-    return page;
+    Logger.perf("Browser pool initialization", Date.now() - startTime);
+    return browserPool;
   } catch (error) {
-    Logger.error("Failed to create page:", error.message);
+    Logger.error("Failed to initialize browser pool:", error.message);
     throw error;
   }
 }
 
-// Enhanced random cars fetching with comprehensive error handling
-async function getRandomCars(numberOfCars) {
-  let page;
-  try {
-    page = await getPage();
-    const randomPage = Math.floor(Math.random() * 20) + 1;
-    const url = `https://turbo.az/autos?pages=${randomPage}`;
+// Round-robin browser selection with load balancing
+function getAvailableBrowser() {
+  // Find browser with least active pages
+  let selectedBrowser = browserPool[0];
+  let minPages = selectedBrowser.activePagesCount;
 
-    Logger.info(`Fetching random cars from page ${randomPage}`);
+  for (const browserInstance of browserPool) {
+    if (
+      browserInstance.activePagesCount < minPages &&
+      browserInstance.activePagesCount < MAX_PAGES_PER_BROWSER
+    ) {
+      selectedBrowser = browserInstance;
+      minPages = browserInstance.activePagesCount;
+    }
+  }
 
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
+  if (selectedBrowser.activePagesCount >= MAX_PAGES_PER_BROWSER) {
+    // All browsers are at capacity, use round-robin
+    selectedBrowser = browserPool[currentBrowserIndex];
+    currentBrowserIndex = (currentBrowserIndex + 1) % browserPool.length;
+  }
 
-    // Wait for content to load
-    await page.waitForSelector(".products-i", { timeout: 10000 });
+  selectedBrowser.lastUsed = Date.now();
+  return selectedBrowser;
+}
 
-    const carUrls = await page.evaluate((numberOfCars) => {
-      const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
-      const sampleSize = (arr, n = 1) => shuffle(arr).slice(0, n);
+// Optimized page creation with reuse
+const pagePool = [];
+const MAX_PAGE_POOL_SIZE = 20;
 
-      const carDatas = [...document.querySelectorAll(".products-i")]
-        .map((elem) => elem.querySelector(".products-i__link")?.href)
-        .filter(Boolean); // Remove null/undefined values
+async function getOptimizedPage() {
+  const startTime = Date.now();
 
-      return sampleSize(carDatas, Math.min(carDatas.length, numberOfCars));
-    }, numberOfCars);
-
-    Logger.info(`Found ${carUrls.length} car URLs`);
-    return carUrls;
-  } catch (error) {
-    Logger.error("Error fetching random cars:", error.message);
-    throw new PageProcessingError(
-      "Failed to fetch random cars",
-      "turbo.az",
-      error
-    );
-  } finally {
-    if (page) {
+  // Try to reuse page from pool
+  if (pagePool.length > 0) {
+    const page = pagePool.pop();
+    try {
+      // Reset page state
+      await page.goto("about:blank");
+      await page.setViewport({ width: 1366, height: 768 });
+      Logger.perf("Page reuse", Date.now() - startTime);
+      return { page, fromPool: true };
+    } catch (error) {
+      Logger.warn("Failed to reuse page, creating new one");
       try {
         await page.close();
-      } catch (closeError) {
-        Logger.error("Error closing page:", closeError.message);
+      } catch (e) {
+        /* ignore */
       }
+    }
+  }
+
+  // Create new page
+  const browserInstance = getAvailableBrowser();
+  browserInstance.activePagesCount++;
+
+  try {
+    const page = await browserInstance.browser.newPage();
+
+    // Optimize page settings
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setDefaultTimeout(10000);
+    await page.setDefaultNavigationTimeout(15000);
+
+    // Aggressive request filtering for better performance
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const resourceType = req.resourceType();
+      const url = req.url();
+
+      // Block unnecessary resources more aggressively
+      if (
+        [
+          "image",
+          "stylesheet",
+          "font",
+          "media",
+          "websocket",
+          "texttrack",
+          "eventsource",
+          "manifest",
+        ].includes(resourceType) ||
+        url.includes("analytics") ||
+        url.includes("tracking") ||
+        url.includes("ads") ||
+        url.includes("facebook") ||
+        url.includes("google-analytics")
+      ) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    // Disable unnecessary features
+    await page.evaluateOnNewDocument(() => {
+      // Disable images
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+
+      // Mock console to reduce overhead
+      if (window.location.hostname !== "localhost") {
+        console.log = console.warn = console.info = console.debug = () => {};
+      }
+    });
+
+    Logger.perf("New page creation", Date.now() - startTime);
+    return { page, browserInstance, fromPool: false };
+  } catch (error) {
+    browserInstance.activePagesCount--;
+    throw error;
+  }
+}
+
+// Optimized page cleanup
+async function releasePage(page, browserInstance, reuse = true) {
+  try {
+    if (browserInstance) {
+      browserInstance.activePagesCount--;
+    }
+
+    if (reuse && pagePool.length < MAX_PAGE_POOL_SIZE) {
+      // Clear page state but keep it for reuse
+      await page.evaluate(() => {
+        // Clear all timers and intervals
+        const maxId = setTimeout(() => {}, 0);
+        for (let i = 0; i < maxId; i++) {
+          clearTimeout(i);
+          clearInterval(i);
+        }
+
+        // Clear DOM
+        if (document.body) {
+          document.body.innerHTML = "";
+        }
+      });
+
+      pagePool.push(page);
+    } else {
+      await page.close();
+    }
+  } catch (error) {
+    Logger.warn("Error releasing page:", error.message);
+    try {
+      await page.close();
+    } catch (e) {
+      /* ignore */
     }
   }
 }
 
-// Enhanced car info fetching with retry logic
-async function getCarInfo(carUrl, retryCount = 0) {
-  const MAX_RETRIES = 2;
-  let page;
+// Ultra-fast car URL extraction with minimal DOM interaction
+async function getRandomCarsOptimized(numberOfCars) {
+  const startTime = Date.now();
+  const cacheKey = `carUrls_${numberOfCars}`;
+
+  // Check cache first
+  const cachedUrls = cache.get(cacheKey);
+  if (cachedUrls) {
+    Logger.perf("Car URLs cache hit", Date.now() - startTime);
+    return cachedUrls;
+  }
+
+  const pageResult = await getOptimizedPage();
+  const { page, browserInstance } = pageResult;
 
   try {
-    page = await getPage();
-    Logger.info(`Fetching car info from: ${carUrl}`);
+    const randomPage = Math.floor(Math.random() * 10) + 1; // Reduce range for faster response
+    const url = `https://turbo.az/autos?pages=${randomPage}`;
 
-    await page.goto(carUrl, {
+    Logger.info(`Fetching car URLs from page ${randomPage}`);
+
+    // Navigate with minimal waiting
+    await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: 30000,
+      timeout: 15000,
     });
 
-    // Wait for essential content
-    await page.waitForSelector(".product-title", { timeout: 10000 });
+    // Extract URLs with minimal DOM queries
+    const carUrls = await page.evaluate((numberOfCars) => {
+      const links = document.querySelectorAll(".products-i__link");
+      const urls = Array.from(links, (link) => link.href).filter(Boolean);
 
+      // Fast random sampling using Fisher-Yates shuffle (partial)
+      const result = [];
+      const maxItems = Math.min(urls.length, numberOfCars);
+
+      for (let i = 0; i < maxItems; i++) {
+        const randomIndex = i + Math.floor(Math.random() * (urls.length - i));
+        [urls[i], urls[randomIndex]] = [urls[randomIndex], urls[i]];
+        result.push(urls[i]);
+      }
+
+      return result;
+    }, numberOfCars);
+
+    // Cache for 5 minutes
+    cache.set(cacheKey, carUrls, 300);
+
+    Logger.perf("Car URLs extraction", Date.now() - startTime);
+    return carUrls;
+  } finally {
+    await releasePage(page, browserInstance);
+  }
+}
+
+// Highly optimized car info extraction
+async function getCarInfoOptimized(carUrl) {
+  const startTime = Date.now();
+  const cacheKey = `car_${carUrl}`;
+
+  // Check cache first
+  const cachedInfo = cache.get(cacheKey);
+  if (cachedInfo) {
+    Logger.perf("Car info cache hit", Date.now() - startTime);
+    return cachedInfo;
+  }
+
+  const pageResult = await getOptimizedPage();
+  const { page, browserInstance } = pageResult;
+
+  try {
+    await page.goto(carUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
+    });
+
+    // Extract all data in a single evaluate call to minimize context switches
     const carInfo = await page.evaluate(
       (USD_AZN, EURO_AZN) => {
-        const getManatPrice = (string) => {
+        const getManatPrice = (priceText) => {
+          if (!priceText) return null;
           try {
-            if (!string) return null;
-            const stringList = string.split(" ");
-            const currency = stringList[stringList.length - 1];
-            const value = stringList
-              .slice(0, stringList.length - 1)
-              .reduce((res, elem) => res + elem.replace(",", ""), "");
+            const parts = priceText.trim().split(" ");
+            const currency = parts[parts.length - 1];
+            const value = parseFloat(
+              parts.slice(0, -1).join("").replace(/,/g, "")
+            );
 
-            const numValue = parseFloat(value);
-            if (isNaN(numValue)) return null;
+            if (isNaN(value)) return null;
 
-            if (currency === "AZN") {
-              return numValue;
-            } else if (currency === "USD") {
-              return Math.round(numValue * (USD_AZN || 1.7));
-            } else if (currency === "EUR") {
-              return Math.round(numValue * (EURO_AZN || 1.8));
+            switch (currency) {
+              case "AZN":
+                return value;
+              case "USD":
+                return Math.round(value * USD_AZN);
+              case "EUR":
+                return Math.round(value * EURO_AZN);
+              default:
+                return null;
             }
-            return null;
-          } catch (error) {
-            console.error("Price parsing error:", error);
+          } catch {
             return null;
           }
         };
 
-        try {
-          return {
-            title:
-              document
-                .querySelector(".product-title")
-                ?.textContent?.split(", ")[0] || "Unknown",
-            year:
-              document.querySelector(
-                ".product-properties__i-name[for='ad_reg_year']+span a"
-              )?.textContent || "Unknown",
-            mileage:
-              document
-                .querySelector(".product-properties__i-name[for='ad_mileage']")
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            engine:
-              document
-                .querySelector(
-                  ".product-properties__i-name[for='ad_engine_volume']"
-                )
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            transmission:
-              document
-                .querySelector(
-                  ".product-properties__i-name[for='ad_transmission']"
-                )
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            images: [
-              ...document.querySelectorAll(
-                ".slick-slide:not(.slick-cloned) img"
-              ),
-            ]
-              .map((elem) => elem.src)
-              .filter((src) => src && !src.includes("data:image")),
-            price:
-              getManatPrice(
-                document.querySelector(".product-price__i")?.textContent
-              ) || "Unknown",
-            url: window.location.href,
-          };
-        } catch (error) {
-          console.error("Data extraction error:", error);
-          return {
-            error: "Failed to extract car data",
-            url: window.location.href,
-          };
-        }
+        const getText = (selector) => {
+          const element = document.querySelector(selector);
+          return element ? element.textContent.trim() : "Unknown";
+        };
+
+        const getPropertyValue = (propertyName) => {
+          const element = document.querySelector(`[for='${propertyName}']`);
+          return element && element.nextSibling
+            ? element.nextSibling.textContent.trim()
+            : "Unknown";
+        };
+
+        // Extract images more efficiently
+        const imageElements = document.querySelectorAll(
+          ".slick-slide:not(.slick-cloned) img"
+        );
+        const images = Array.from(imageElements)
+          .map((img) => img.src)
+          .filter((src) => src && !src.startsWith("data:"))
+          .slice(0, 5); // Limit to 5 images for performance
+
+        return {
+          title: getText(".product-title").split(", ")[0] || "Unknown",
+          year: getText("[for='ad_reg_year']+span a"),
+          mileage: getPropertyValue("ad_mileage"),
+          engine: getPropertyValue("ad_engine_volume"),
+          transmission: getPropertyValue("ad_transmission"),
+          images,
+          price: getManatPrice(getText(".product-price__i")),
+          url: location.href,
+        };
       },
       USD_AZN,
       EURO_AZN
     );
 
-    Logger.info(`Successfully fetched car info: ${carInfo.title}`);
+    // Cache for 10 minutes
+    cache.set(cacheKey, carInfo, 600);
+
+    Logger.perf("Car info extraction", Date.now() - startTime);
     return carInfo;
   } catch (error) {
-    Logger.error(
-      `Error fetching car info (attempt ${retryCount + 1}):`,
-      error.message
-    );
-
-    if (retryCount < MAX_RETRIES) {
-      Logger.info(`Retrying car info fetch for ${carUrl}...`);
-      await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds
-      return getCarInfo(carUrl, retryCount + 1);
-    }
-
+    Logger.error(`Car info extraction failed for ${carUrl}:`, error.message);
     return {
       error: "Failed to fetch car details",
       url: carUrl,
@@ -372,260 +474,264 @@ async function getCarInfo(carUrl, retryCount = 0) {
       price: "Unknown",
     };
   } finally {
-    if (page) {
-      try {
-        await page.close();
-      } catch (closeError) {
-        Logger.error("Error closing page:", closeError.message);
-      }
-    }
+    await releasePage(page, browserInstance);
   }
 }
 
-// Enhanced currency fetching with fallbacks
-async function getEuroConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json",
-    "https://api.exchangerate-api.com/v4/latest/EUR",
-  ];
+// Optimized exchange rate fetching with better caching
+async function updateExchangeRates() {
+  const startTime = Date.now();
 
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching EUR/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        EURO_AZN = response.data.eur.azn;
-      } else {
-        EURO_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`EURO_AZN rate updated: ${EURO_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching EUR rate from ${apiUrl}:`, error.message);
-    }
+  const cachedRates = exchangeRateCache.get("rates");
+  if (cachedRates) {
+    USD_AZN = cachedRates.USD_AZN;
+    EURO_AZN = cachedRates.EURO_AZN;
+    Logger.perf("Exchange rates cache hit", Date.now() - startTime);
+    return;
   }
 
-  Logger.warn(`Using fallback EUR/AZN rate: ${EURO_AZN}`);
-}
-
-async function getUsdConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-    "https://api.exchangerate-api.com/v4/latest/USD",
-  ];
-
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching USD/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        USD_AZN = response.data.usd.azn;
-      } else {
-        USD_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`USD_AZN rate updated: ${USD_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching USD rate from ${apiUrl}:`, error.message);
-    }
-  }
-
-  Logger.warn(`Using fallback USD/AZN rate: ${USD_AZN}`);
-}
-
-// Enhanced API endpoint with comprehensive error handling
-app.get("/get-random-cars", async (req, res) => {
   try {
-    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 50); // Limit max cars
-    Logger.info(`Processing request for ${numberOfCars} random cars`);
+    // Fetch both rates in parallel with shorter timeout
+    const [usdResponse, eurResponse] = await Promise.allSettled([
+      axiosInstance.get(
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json"
+      ),
+      axiosInstance.get(
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json"
+      ),
+    ]);
 
-    const cars = await getRandomCars(numberOfCars);
+    if (usdResponse.status === "fulfilled") {
+      USD_AZN = usdResponse.value.data.usd.azn || USD_AZN;
+    }
 
-    if (cars.length === 0) {
-      Logger.warn("No cars found");
+    if (eurResponse.status === "fulfilled") {
+      EURO_AZN = eurResponse.value.data.eur.azn || EURO_AZN;
+    }
+
+    // Cache the rates
+    exchangeRateCache.set("rates", { USD_AZN, EURO_AZN });
+
+    Logger.info(`Exchange rates updated: USD=${USD_AZN}, EUR=${EURO_AZN}`);
+    Logger.perf("Exchange rates update", Date.now() - startTime);
+  } catch (error) {
+    Logger.warn("Failed to update exchange rates, using cached/default values");
+  }
+}
+
+// Ultra-optimized main endpoint
+app.get("/get-random-cars", async (req, res) => {
+  const requestStart = Date.now();
+
+  try {
+    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 30); // Reduced default and max
+
+    // Check for complete cache hit
+    const fullCacheKey = `fullResponse_${numberOfCars}`;
+    const cachedResponse = cache.get(fullCacheKey);
+    if (cachedResponse) {
+      Logger.perf("Full response cache hit", Date.now() - requestStart);
+      return res.json(cachedResponse);
+    }
+
+    Logger.info(`Processing optimized request for ${numberOfCars} cars`);
+
+    // Get car URLs
+    const urlFetchStart = Date.now();
+    const carUrls = await getRandomCarsOptimized(numberOfCars);
+    Logger.perf("URL fetch", Date.now() - urlFetchStart);
+
+    if (carUrls.length === 0) {
       return res.status(404).json({
         error: "No cars found",
-        message: "Unable to fetch car listings from the source",
+        message: "Unable to fetch car listings",
       });
     }
 
-    // Process cars with controlled concurrency
-    const BATCH_SIZE = 5;
-    const carInfos = [];
+    // Process cars with optimized concurrency
+    const infoFetchStart = Date.now();
+    const OPTIMAL_CONCURRENCY = Math.min(8, carUrls.length); // Increased concurrency
+    const carInfoPromises = [];
 
-    for (let i = 0; i < cars.length; i += BATCH_SIZE) {
-      const batch = cars.slice(i, i + BATCH_SIZE);
-      Logger.info(
-        `Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(
-          cars.length / BATCH_SIZE
-        )}`
-      );
+    // Process in batches with higher concurrency
+    for (let i = 0; i < carUrls.length; i += OPTIMAL_CONCURRENCY) {
+      const batch = carUrls.slice(i, i + OPTIMAL_CONCURRENCY);
+      const batchPromises = batch.map((url) => getCarInfoOptimized(url));
+      carInfoPromises.push(...batchPromises);
 
-      const batchResults = await Promise.allSettled(
-        batch.map((car) => getCarInfo(car))
-      );
-
-      batchResults.forEach((result, index) => {
-        if (result.status === "fulfilled") {
-          carInfos.push(result.value);
-        } else {
-          Logger.error(
-            `Failed to process car ${batch[index]}:`,
-            result.reason?.message
-          );
-          carInfos.push({
-            error: "Failed to fetch car details",
-            url: batch[index] || "Unknown",
-            title: "Unknown",
-          });
-        }
-      });
-
-      // Small delay between batches to avoid overwhelming the server
-      if (i + BATCH_SIZE < cars.length) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      // Small delay between batches to prevent overwhelming
+      if (i + OPTIMAL_CONCURRENCY < carUrls.length) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
 
-    const successfulCars = carInfos.filter((car) => !car.error);
-    Logger.info(
-      `Successfully processed ${successfulCars.length}/${cars.length} cars`
+    const carInfoResults = await Promise.allSettled(carInfoPromises);
+    const carInfos = carInfoResults.map((result) =>
+      result.status === "fulfilled"
+        ? result.value
+        : {
+            error: "Failed to fetch",
+            title: "Unknown",
+          }
     );
 
-    // Cache successful results
-    if (successfulCars.length > 0) {
-      cache.set("randomCars", carInfos);
-    }
+    Logger.perf("Info fetch", Date.now() - infoFetchStart);
 
-    res.json({
+    const successfulCars = carInfos.filter((car) => !car.error);
+
+    const response = {
       cars: carInfos,
       stats: {
         requested: numberOfCars,
-        found: cars.length,
+        found: carUrls.length,
         processed: carInfos.length,
         successful: successfulCars.length,
         failed: carInfos.length - successfulCars.length,
+        processingTime: Date.now() - requestStart,
       },
-    });
+    };
+
+    // Cache successful complete responses
+    if (successfulCars.length > 0) {
+      cache.set(fullCacheKey, response, 180); // 3 minutes cache
+    }
+
+    Logger.perf("Total request", Date.now() - requestStart);
+    Logger.info(
+      `Successfully processed ${successfulCars.length}/${
+        carUrls.length
+      } cars in ${Date.now() - requestStart}ms`
+    );
+
+    res.json(response);
   } catch (error) {
     Logger.error("Critical error in /get-random-cars:", error.message);
 
-    if (error instanceof BrowserLaunchError) {
-      res.status(503).json({
-        error: "Service temporarily unavailable",
-        message: "Browser service is not available. Please try again later.",
-        code: "BROWSER_UNAVAILABLE",
-      });
-    } else if (error instanceof PageProcessingError) {
-      res.status(502).json({
-        error: "External service error",
-        message: "Unable to fetch data from car listings website.",
-        code: "EXTERNAL_SERVICE_ERROR",
-      });
-    } else {
-      res.status(500).json({
-        error: "Internal server error",
-        message: "An unexpected error occurred while processing your request.",
-        code: "INTERNAL_ERROR",
-      });
-    }
-  }
-});
-
-// Health check endpoint
-app.get("/health", async (req, res) => {
-  try {
-    const browserStatus =
-      browser && !browser.disconnected ? "running" : "stopped";
-
-    res.json({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      browser: browserStatus,
-      cache: {
-        keys: cache.keys().length,
-        stats: cache.getStats(),
-      },
-      exchangeRates: {
-        USD_AZN,
-        EURO_AZN,
-      },
-    });
-  } catch (error) {
-    Logger.error("Health check error:", error.message);
     res.status(500).json({
-      status: "error",
-      message: error.message,
+      error: "Internal server error",
+      message: "Service temporarily unavailable",
+      code: "INTERNAL_ERROR",
     });
   }
 });
 
-// Graceful shutdown handling
-process.on("SIGTERM", async () => {
-  Logger.info("SIGTERM received, shutting down gracefully...");
+// Lightweight health check
+app.get("/health", (req, res) => {
+  const healthData = {
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    browserPool: browserPool.length,
+    activeBrowsers: browserPool.filter((b) => !b.browser.disconnected).length,
+    cache: {
+      keys: cache.keys().length,
+      hits: cache.getStats().hits,
+      misses: cache.getStats().misses,
+    },
+    exchangeRates: { USD_AZN, EURO_AZN },
+    memory: process.memoryUsage(),
+    uptime: process.uptime(),
+  };
+
+  res.json(healthData);
+});
+
+// Cleanup endpoint for manual cache clearing
+app.post("/admin/clear-cache", (req, res) => {
+  cache.flushAll();
+  exchangeRateCache.flushAll();
+  res.json({ message: "Cache cleared successfully" });
+});
+
+// Graceful shutdown with proper cleanup
+async function gracefulShutdown(signal) {
+  Logger.info(`${signal} received, shutting down gracefully...`);
+
   try {
-    if (browser) {
-      await browser.close();
-      Logger.info("Browser closed successfully");
-    }
+    // Close all pages in pool
+    await Promise.all(
+      pagePool.map((page) =>
+        page
+          .close()
+          .catch((e) => Logger.warn("Error closing pooled page:", e.message))
+      )
+    );
+
+    // Close all browsers
+    await Promise.all(
+      browserPool.map(({ browser }) =>
+        browser
+          .close()
+          .catch((e) => Logger.warn("Error closing browser:", e.message))
+      )
+    );
+
+    Logger.info("All browsers closed successfully");
   } catch (error) {
     Logger.error("Error during shutdown:", error.message);
   }
-  process.exit(0);
-});
 
-process.on("SIGINT", async () => {
-  Logger.info("SIGINT received, shutting down gracefully...");
-  try {
-    if (browser) {
-      await browser.close();
-      Logger.info("Browser closed successfully");
-    }
-  } catch (error) {
-    Logger.error("Error during shutdown:", error.message);
-  }
   process.exit(0);
-});
+}
 
-// Unhandled rejection handler
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Enhanced error handlers
 process.on("unhandledRejection", (reason, promise) => {
-  Logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+  Logger.error("Unhandled Rejection:", reason);
 });
 
-// Uncaught exception handler
 process.on("uncaughtException", (error) => {
   Logger.error("Uncaught Exception:", error.message);
-  process.exit(1);
+  gracefulShutdown("UNCAUGHT_EXCEPTION");
 });
 
-// Server startup with enhanced error handling
+// Background tasks
+setInterval(() => {
+  updateExchangeRates().catch((err) =>
+    Logger.warn("Background exchange rate update failed:", err.message)
+  );
+}, 3600000); // Update every hour
+
+// Browser health check and restart if needed
+setInterval(() => {
+  browserPool.forEach(async ({ browser }, index) => {
+    try {
+      if (browser.disconnected) {
+        Logger.warn(`Browser ${index} disconnected, restarting...`);
+        const newBrowser = await launchOptimizedBrowser();
+        browserPool[index] = {
+          browser: newBrowser,
+          activePagesCount: 0,
+          lastUsed: Date.now(),
+        };
+      }
+    } catch (error) {
+      Logger.error(`Failed to restart browser ${index}:`, error.message);
+    }
+  });
+}, 300000); // Check every 5 minutes
+
+// Server startup
 app.listen(PORT, async () => {
   try {
-    Logger.info(`Server starting on port ${PORT}...`);
+    Logger.info(`🚀 Starting optimized server on port ${PORT}...`);
 
-    // Initialize browser
-    await launchBrowser();
-    Logger.info("Browser initialized successfully");
+    // Initialize browser pool
+    await initializeBrowserPool();
+    Logger.info(
+      `✅ Browser pool initialized with ${browserPool.length} instances`
+    );
 
     // Initialize exchange rates
-    await Promise.allSettled([getEuroConverts(), getUsdConverts()]);
-    Logger.info("Exchange rates initialized");
+    await updateExchangeRates();
+    Logger.info("✅ Exchange rates initialized");
 
-    Logger.info(`[SERVER] ExpressJS is listening on http://localhost:${PORT}`);
-    Logger.info("Health check available at: /health");
+    Logger.info(`🎯 Server ready at http://localhost:${PORT}`);
+    Logger.info(`📊 Health check: http://localhost:${PORT}/health`);
+    Logger.info(`🏎️  Ready to serve optimized car data!`);
   } catch (error) {
-    Logger.error("Server startup error:", error.message);
-    if (error instanceof BrowserLaunchError) {
-      Logger.error(
-        "⚠️  Browser launch failed. Server will continue but /get-random-cars endpoint may not work properly."
-      );
-      Logger.error(
-        "Please check your Docker setup and ensure Chromium is properly installed."
-      );
-    }
+    Logger.error("❌ Server startup failed:", error.message);
+    process.exit(1);
   }
 });
