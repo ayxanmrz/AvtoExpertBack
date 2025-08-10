@@ -50,7 +50,7 @@ ENV NODE_ENV=production
 ENV NPM_CONFIG_CACHE=/tmp/.npm
 
 # Performance optimizations
-ENV NODE_OPTIONS="--max-old-space-size=4096 --optimize-for-size"
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 WORKDIR /usr/src/app
 
