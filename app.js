@@ -12,6 +12,7 @@ import os from "os";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 
+
 dotenv.config();
 
 const PORT = 4000;
@@ -38,7 +39,22 @@ let browserPool = [];
 let availablePages = [];
 let busyPages = new Set();
 
-let EURO_AZN = 1.8; // Default fallback values
+
+// Enhanced cache with longer TTL and more aggressive caching
+const cache = new NodeCache({
+  stdTTL: 1800, // 30 minutes
+  checkperiod: 120, // Check for expired keys every 2 minutes
+  useClones: false, // Avoid deep cloning for better performance
+  maxKeys: 1000, // Limit memory usage
+});
+
+// Performance optimized cache for exchange rates
+const exchangeRateCache = new NodeCache({
+  stdTTL: 3600, // 1 hour for exchange rates
+  maxKeys: 10,
+});
+
+let EURO_AZN = 1.8;
 let USD_AZN = 1.7;
 let browserLaunchAttempts = 0;
 const MAX_BROWSER_LAUNCH_ATTEMPTS = 3;
@@ -60,9 +76,15 @@ const performanceMetrics = {
 };
 
 // Enhanced logging utility with performance tracking
+
 class Logger {
   static info(message, data = null) {
-    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, data || "");
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `[INFO] ${new Date().toISOString()} - ${message}`,
+        data || ""
+      );
+    }
   }
 
   static error(message, error = null) {
@@ -82,23 +104,26 @@ class Logger {
   }
 }
 
-// Custom error classes
-class BrowserLaunchError extends Error {
-  constructor(message, originalError) {
-    super(message);
-    this.name = "BrowserLaunchError";
-    this.originalError = originalError;
+
+  static perf(operation, duration) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[PERF] ${operation}: ${duration}ms`);
+    }
   }
 }
 
-class PageProcessingError extends Error {
-  constructor(message, url, originalError) {
-    super(message);
-    this.name = "PageProcessingError";
-    this.url = url;
-    this.originalError = originalError;
-  }
-}
+// Performance monitoring middleware
+app.use((req, res, next) => {
+  req.startTime = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - req.startTime;
+    if (duration > 1000) {
+      // Log slow requests
+      Logger.warn(`Slow request: ${req.method} ${req.path} took ${duration}ms`);
+    }
+  });
+  next();
+});
 
 // Security middleware
 app.use(helmet({
@@ -524,7 +549,7 @@ async function getRandomCars(numberOfCars) {
     const randomPage = Math.floor(Math.random() * 20) + 1;
     const url = `https://turbo.az/autos?pages=${randomPage}`;
 
-    Logger.info(`Fetching random cars from page ${randomPage}`);
+    Logger.info(`Fetching car URLs from page ${randomPage}`);
 
     const startTime = Date.now();
     await page.goto(url, {
@@ -535,15 +560,22 @@ async function getRandomCars(numberOfCars) {
     // Wait for content to load with reduced timeout
     await page.waitForSelector(".products-i", { timeout: 8000 });
 
+
     const carUrls = await page.evaluate((numberOfCars) => {
-      const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
-      const sampleSize = (arr, n = 1) => shuffle(arr).slice(0, n);
+      const links = document.querySelectorAll(".products-i__link");
+      const urls = Array.from(links, (link) => link.href).filter(Boolean);
 
-      const carDatas = [...document.querySelectorAll(".products-i")]
-        .map((elem) => elem.querySelector(".products-i__link")?.href)
-        .filter(Boolean); // Remove null/undefined values
+      // Fast random sampling using Fisher-Yates shuffle (partial)
+      const result = [];
+      const maxItems = Math.min(urls.length, numberOfCars);
 
-      return sampleSize(carDatas, Math.min(carDatas.length, numberOfCars));
+      for (let i = 0; i < maxItems; i++) {
+        const randomIndex = i + Math.floor(Math.random() * (urls.length - i));
+        [urls[i], urls[randomIndex]] = [urls[randomIndex], urls[i]];
+        result.push(urls[i]);
+      }
+
+      return result;
     }, numberOfCars);
 
     Logger.perf(`Found ${carUrls.length} car URLs`, Date.now() - startTime);
@@ -551,14 +583,8 @@ async function getRandomCars(numberOfCars) {
     // Cache the result
     cache.set(cacheKey, carUrls, 180); // Cache for 3 minutes
     
+
     return carUrls;
-  } catch (error) {
-    Logger.error("Error fetching random cars:", error.message);
-    throw new PageProcessingError(
-      "Failed to fetch random cars",
-      "turbo.az",
-      error
-    );
   } finally {
     if (pageInfo) {
       returnPageToPool(pageInfo);
@@ -598,28 +624,28 @@ async function getCarInfo(carUrl, retryCount = 0) {
 
     const carInfo = await page.evaluate(
       (USD_AZN, EURO_AZN) => {
-        const getManatPrice = (string) => {
+        const getManatPrice = (priceText) => {
+          if (!priceText) return null;
           try {
-            if (!string) return null;
-            const stringList = string.split(" ");
-            const currency = stringList[stringList.length - 1];
-            const value = stringList
-              .slice(0, stringList.length - 1)
-              .reduce((res, elem) => res + elem.replace(",", ""), "");
+            const parts = priceText.trim().split(" ");
+            const currency = parts[parts.length - 1];
+            const value = parseFloat(
+              parts.slice(0, -1).join("").replace(/,/g, "")
+            );
 
-            const numValue = parseFloat(value);
-            if (isNaN(numValue)) return null;
+            if (isNaN(value)) return null;
 
-            if (currency === "AZN") {
-              return numValue;
-            } else if (currency === "USD") {
-              return Math.round(numValue * (USD_AZN || 1.7));
-            } else if (currency === "EUR") {
-              return Math.round(numValue * (EURO_AZN || 1.8));
+            switch (currency) {
+              case "AZN":
+                return value;
+              case "USD":
+                return Math.round(value * USD_AZN);
+              case "EUR":
+                return Math.round(value * EURO_AZN);
+              default:
+                return null;
             }
-            return null;
-          } catch (error) {
-            console.error("Price parsing error:", error);
+          } catch {
             return null;
           }
         };
@@ -711,77 +737,77 @@ async function getCarInfo(carUrl, retryCount = 0) {
     if (pageInfo) {
       returnPageToPool(pageInfo);
     }
+
   }
 }
 
-// Enhanced currency fetching with fallbacks
-async function getEuroConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json",
-    "https://api.exchangerate-api.com/v4/latest/EUR",
-  ];
+// Optimized exchange rate fetching with better caching
+async function updateExchangeRates() {
+  const startTime = Date.now();
 
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching EUR/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        EURO_AZN = response.data.eur.azn;
-      } else {
-        EURO_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`EURO_AZN rate updated: ${EURO_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching EUR rate from ${apiUrl}:`, error.message);
-    }
+  const cachedRates = exchangeRateCache.get("rates");
+  if (cachedRates) {
+    USD_AZN = cachedRates.USD_AZN;
+    EURO_AZN = cachedRates.EURO_AZN;
+    Logger.perf("Exchange rates cache hit", Date.now() - startTime);
+    return;
   }
 
-  Logger.warn(`Using fallback EUR/AZN rate: ${EURO_AZN}`);
-}
-
-async function getUsdConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-    "https://api.exchangerate-api.com/v4/latest/USD",
-  ];
-
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching USD/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        USD_AZN = response.data.usd.azn;
-      } else {
-        USD_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`USD_AZN rate updated: ${USD_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching USD rate from ${apiUrl}:`, error.message);
-    }
-  }
-
-  Logger.warn(`Using fallback USD/AZN rate: ${USD_AZN}`);
-}
-
-// Enhanced API endpoint with comprehensive error handling
-app.get("/get-random-cars", async (req, res) => {
   try {
-    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 50); // Limit max cars
-    Logger.info(`Processing request for ${numberOfCars} random cars`);
+    // Fetch both rates in parallel with shorter timeout
+    const [usdResponse, eurResponse] = await Promise.allSettled([
+      axiosInstance.get(
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json"
+      ),
+      axiosInstance.get(
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json"
+      ),
+    ]);
 
-    const cars = await getRandomCars(numberOfCars);
+    if (usdResponse.status === "fulfilled") {
+      USD_AZN = usdResponse.value.data.usd.azn || USD_AZN;
+    }
 
-    if (cars.length === 0) {
-      Logger.warn("No cars found");
+    if (eurResponse.status === "fulfilled") {
+      EURO_AZN = eurResponse.value.data.eur.azn || EURO_AZN;
+    }
+
+    // Cache the rates
+    exchangeRateCache.set("rates", { USD_AZN, EURO_AZN });
+
+    Logger.info(`Exchange rates updated: USD=${USD_AZN}, EUR=${EURO_AZN}`);
+    Logger.perf("Exchange rates update", Date.now() - startTime);
+  } catch (error) {
+    Logger.warn("Failed to update exchange rates, using cached/default values");
+  }
+}
+
+// Ultra-optimized main endpoint
+app.get("/get-random-cars", async (req, res) => {
+  const requestStart = Date.now();
+
+  try {
+    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 30); // Reduced default and max
+
+    // Check for complete cache hit
+    const fullCacheKey = `fullResponse_${numberOfCars}`;
+    const cachedResponse = cache.get(fullCacheKey);
+    if (cachedResponse) {
+      Logger.perf("Full response cache hit", Date.now() - requestStart);
+      return res.json(cachedResponse);
+    }
+
+    Logger.info(`Processing optimized request for ${numberOfCars} cars`);
+
+    // Get car URLs
+    const urlFetchStart = Date.now();
+    const carUrls = await getRandomCarsOptimized(numberOfCars);
+    Logger.perf("URL fetch", Date.now() - urlFetchStart);
+
+    if (carUrls.length === 0) {
       return res.status(404).json({
         error: "No cars found",
-        message: "Unable to fetch car listings from the source",
+        message: "Unable to fetch car listings",
       });
     }
 
@@ -843,50 +869,36 @@ app.get("/get-random-cars", async (req, res) => {
     
     Logger.perf(`Total processing completed`, Date.now() - processingStartTime);
 
-    const successfulCars = carInfos.filter((car) => !car.error);
-    Logger.info(
-      `Successfully processed ${successfulCars.length}/${cars.length} cars`
+    const carInfoResults = await Promise.allSettled(carInfoPromises);
+    const carInfos = carInfoResults.map((result) =>
+      result.status === "fulfilled"
+        ? result.value
+        : {
+            error: "Failed to fetch",
+            title: "Unknown",
+          }
     );
 
-    // Cache successful results
-    if (successfulCars.length > 0) {
-      cache.set("randomCars", carInfos);
-    }
+    Logger.perf("Info fetch", Date.now() - infoFetchStart);
 
-    res.json({
+    const successfulCars = carInfos.filter((car) => !car.error);
+
+    const response = {
       cars: carInfos,
       stats: {
         requested: numberOfCars,
-        found: cars.length,
+        found: carUrls.length,
         processed: carInfos.length,
         successful: successfulCars.length,
         failed: carInfos.length - successfulCars.length,
+        processingTime: Date.now() - requestStart,
       },
-    });
-  } catch (error) {
-    Logger.error("Critical error in /get-random-cars:", error.message);
+    };
 
-    if (error instanceof BrowserLaunchError) {
-      res.status(503).json({
-        error: "Service temporarily unavailable",
-        message: "Browser service is not available. Please try again later.",
-        code: "BROWSER_UNAVAILABLE",
-      });
-    } else if (error instanceof PageProcessingError) {
-      res.status(502).json({
-        error: "External service error",
-        message: "Unable to fetch data from car listings website.",
-        code: "EXTERNAL_SERVICE_ERROR",
-      });
-    } else {
-      res.status(500).json({
-        error: "Internal server error",
-        message: "An unexpected error occurred while processing your request.",
-        code: "INTERNAL_ERROR",
-      });
+    // Cache successful complete responses
+    if (successfulCars.length > 0) {
+      cache.set(fullCacheKey, response, 180); // 3 minutes cache
     }
-  }
-});
 
 // Enhanced metrics endpoint
 app.get("/metrics", async (req, res) => {
@@ -964,10 +976,12 @@ app.get("/health", async (req, res) => {
       }
     });
   } catch (error) {
-    Logger.error("Health check error:", error.message);
+    Logger.error("Critical error in /get-random-cars:", error.message);
+
     res.status(500).json({
-      status: "error",
-      message: error.message,
+      error: "Internal server error",
+      message: "Service temporarily unavailable",
+      code: "INTERNAL_ERROR",
     });
   }
 });
@@ -987,10 +1001,20 @@ process.on("SIGTERM", async () => {
     Logger.error("Error during shutdown:", error.message);
   }
   process.exit(0);
+
 });
 
-process.on("SIGINT", async () => {
-  Logger.info("SIGINT received, shutting down gracefully...");
+// Cleanup endpoint for manual cache clearing
+app.post("/admin/clear-cache", (req, res) => {
+  cache.flushAll();
+  exchangeRateCache.flushAll();
+  res.json({ message: "Cache cleared successfully" });
+});
+
+// Graceful shutdown with proper cleanup
+async function gracefulShutdown(signal) {
+  Logger.info(`${signal} received, shutting down gracefully...`);
+
   try {
     for (const browserInfo of browserPool) {
       if (browserInfo.browser) {
@@ -1002,18 +1026,21 @@ process.on("SIGINT", async () => {
   } catch (error) {
     Logger.error("Error during shutdown:", error.message);
   }
+
   process.exit(0);
-});
+}
 
-// Unhandled rejection handler
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Enhanced error handlers
 process.on("unhandledRejection", (reason, promise) => {
-  Logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+  Logger.error("Unhandled Rejection:", reason);
 });
 
-// Uncaught exception handler
 process.on("uncaughtException", (error) => {
   Logger.error("Uncaught Exception:", error.message);
-  process.exit(1);
+  gracefulShutdown("UNCAUGHT_EXCEPTION");
 });
 
 // Cache management endpoint
@@ -1066,15 +1093,15 @@ app.post("/cache/warm", async (req, res) => {
 // Server startup with enhanced error handling
 app.listen(PORT, async () => {
   try {
-    Logger.info(`Server starting on port ${PORT}...`);
+    Logger.info(`🚀 Starting optimized server on port ${PORT}...`);
 
     // Initialize browser pool
     await initializeBrowserPool();
     Logger.info("Browser pool initialized successfully");
 
     // Initialize exchange rates
-    await Promise.allSettled([getEuroConverts(), getUsdConverts()]);
-    Logger.info("Exchange rates initialized");
+    await updateExchangeRates();
+    Logger.info("✅ Exchange rates initialized");
 
     // Initial cache warming
     setImmediate(() => {
@@ -1088,14 +1115,7 @@ app.listen(PORT, async () => {
     Logger.info("Metrics available at: /metrics");
     Logger.info("Cache management available at: /cache/clear and /cache/warm");
   } catch (error) {
-    Logger.error("Server startup error:", error.message);
-    if (error instanceof BrowserLaunchError) {
-      Logger.error(
-        "⚠️  Browser launch failed. Server will continue but /get-random-cars endpoint may not work properly."
-      );
-      Logger.error(
-        "Please check your Docker setup and ensure Chromium is properly installed."
-      );
-    }
+    Logger.error("❌ Server startup failed:", error.message);
+    process.exit(1);
   }
 });
