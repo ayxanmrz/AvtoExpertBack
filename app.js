@@ -4,13 +4,41 @@ import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
 import dotenv from "dotenv";
+import { Worker } from "worker_threads";
+import { promisify } from "util";
+import compression from "compression";
 import cluster from "cluster";
 import os from "os";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+
 
 dotenv.config();
 
 const PORT = 4000;
 const app = express();
+
+// Enhanced caching with multiple layers
+const cache = new NodeCache({ 
+  stdTTL: 300, // 5 minutes
+  checkperiod: 60, // Check for expired keys every minute
+  useClones: false, // Disable cloning for better performance
+  maxKeys: 1000 // Limit cache size
+});
+
+// Page cache for faster repeated requests
+const pageCache = new NodeCache({ 
+  stdTTL: 600, // 10 minutes for pages
+  maxKeys: 500 
+});
+
+// Browser pool configuration
+const BROWSER_POOL_SIZE = 3;
+const MAX_PAGES_PER_BROWSER = 10;
+let browserPool = [];
+let availablePages = [];
+let busyPages = new Set();
+
 
 // Enhanced cache with longer TTL and more aggressive caching
 const cache = new NodeCache({
@@ -28,21 +56,27 @@ const exchangeRateCache = new NodeCache({
 
 let EURO_AZN = 1.8;
 let USD_AZN = 1.7;
-let browserPool = [];
-const MAX_BROWSER_INSTANCES = Math.min(os.cpus().length, 3); // Limit based on CPU cores
-const MAX_PAGES_PER_BROWSER = 10;
-let currentBrowserIndex = 0;
+let browserLaunchAttempts = 0;
+const MAX_BROWSER_LAUNCH_ATTEMPTS = 3;
+const BROWSER_RETRY_DELAY = 5000; // 5 seconds
 
-// Connection pool for HTTP requests
-const axiosInstance = axios.create({
-  timeout: 5000,
-  maxRedirects: 3,
-  headers: {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-  },
-});
+// Performance monitoring
+const performanceMetrics = {
+  requestCount: 0,
+  totalResponseTime: 0,
+  averageResponseTime: 0,
+  cacheHits: 0,
+  cacheMisses: 0,
+  errorCount: 0,
+  browserPoolStats: {
+    activeBrowsers: 0,
+    availablePages: 0,
+    busyPages: 0
+  }
+};
 
-// Enhanced logging with performance tracking
+// Enhanced logging utility with performance tracking
+
 class Logger {
   static info(message, data = null) {
     if (process.env.NODE_ENV !== "production") {
@@ -58,11 +92,18 @@ class Logger {
       `[ERROR] ${new Date().toISOString()} - ${message}`,
       error || ""
     );
+    performanceMetrics.errorCount++;
   }
 
   static warn(message, data = null) {
     console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, data || "");
   }
+
+  static perf(message, duration = null) {
+    console.log(`[PERF] ${new Date().toISOString()} - ${message}${duration ? ` (${duration}ms)` : ""}`);
+  }
+}
+
 
   static perf(operation, duration) {
     if (process.env.NODE_ENV !== "production") {
@@ -84,264 +125,442 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(
-  cors({
-    origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
-    credentials: true,
-  })
-);
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for API
+  crossOriginEmbedderPolicy: false
+}));
 
-// Optimized browser launch with better resource management
-async function launchOptimizedBrowser() {
-  const launchOptions = {
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-web-security",
-      "--disable-features=VizDisplayCompositor",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-default-apps",
-      "--disable-extensions",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-      "--disable-ipc-flooding-protection",
-      "--disable-hang-monitor",
-      "--disable-popup-blocking",
-      "--disable-prompt-on-repost",
-      "--no-zygote",
-      "--single-process", // Use single process for better resource control
-      "--memory-pressure-off",
-      "--max_old_space_size=4096",
-    ],
-    timeout: 15000,
-    protocolTimeout: 15000,
-    ignoreHTTPSErrors: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-  };
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: {
+    error: "Too many requests",
+    message: "Please try again later"
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
-  const browser = await puppeteer.launch(launchOptions);
+app.use(limiter);
 
-  // Pre-warm browser with a page
-  const warmupPage = await browser.newPage();
-  await warmupPage.goto("data:text/html,<html></html>", {
-    waitUntil: "domcontentloaded",
-  });
-  await warmupPage.close();
+// Middleware optimizations
+app.use(compression({
+  level: 6,
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
 
-  return browser;
-}
+app.use(express.json({ limit: '1mb' }));
+app.use(cors({
+  origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
+  credentials: true,
+  optionsSuccessStatus: 200
+}));
 
-// Browser pool management
-async function initializeBrowserPool() {
+// Performance monitoring middleware
+app.use((req, res, next) => {
   const startTime = Date.now();
-  Logger.info(
-    `Initializing browser pool with ${MAX_BROWSER_INSTANCES} instances`
-  );
-
-  try {
-    const browsers = await Promise.all(
-      Array(MAX_BROWSER_INSTANCES)
-        .fill()
-        .map(() => launchOptimizedBrowser())
-    );
-
-    browserPool = browsers.map((browser) => ({
-      browser,
-      activePagesCount: 0,
-      lastUsed: Date.now(),
-    }));
-
-    Logger.perf("Browser pool initialization", Date.now() - startTime);
-    return browserPool;
-  } catch (error) {
-    Logger.error("Failed to initialize browser pool:", error.message);
-    throw error;
-  }
-}
-
-// Round-robin browser selection with load balancing
-function getAvailableBrowser() {
-  // Find browser with least active pages
-  let selectedBrowser = browserPool[0];
-  let minPages = selectedBrowser.activePagesCount;
-
-  for (const browserInstance of browserPool) {
-    if (
-      browserInstance.activePagesCount < minPages &&
-      browserInstance.activePagesCount < MAX_PAGES_PER_BROWSER
-    ) {
-      selectedBrowser = browserInstance;
-      minPages = browserInstance.activePagesCount;
+  performanceMetrics.requestCount++;
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    performanceMetrics.totalResponseTime += duration;
+    performanceMetrics.averageResponseTime = 
+      performanceMetrics.totalResponseTime / performanceMetrics.requestCount;
+    
+    if (duration > 5000) { // Log slow requests
+      Logger.warn(`Slow request detected: ${req.method} ${req.path} took ${duration}ms`);
     }
-  }
-
-  if (selectedBrowser.activePagesCount >= MAX_PAGES_PER_BROWSER) {
-    // All browsers are at capacity, use round-robin
-    selectedBrowser = browserPool[currentBrowserIndex];
-    currentBrowserIndex = (currentBrowserIndex + 1) % browserPool.length;
-  }
-
-  selectedBrowser.lastUsed = Date.now();
-  return selectedBrowser;
-}
-
-// Optimized page creation with reuse
-const pagePool = [];
-const MAX_PAGE_POOL_SIZE = 20;
-
-async function getOptimizedPage() {
-  const startTime = Date.now();
-
-  // Try to reuse page from pool
-  if (pagePool.length > 0) {
-    const page = pagePool.pop();
-    try {
-      // Reset page state
-      await page.goto("about:blank");
-      await page.setViewport({ width: 1366, height: 768 });
-      Logger.perf("Page reuse", Date.now() - startTime);
-      return { page, fromPool: true };
-    } catch (error) {
-      Logger.warn("Failed to reuse page, creating new one");
-      try {
-        await page.close();
-      } catch (e) {
-        /* ignore */
-      }
-    }
-  }
-
-  // Create new page
-  const browserInstance = getAvailableBrowser();
-  browserInstance.activePagesCount++;
-
-  try {
-    const page = await browserInstance.browser.newPage();
-
-    // Optimize page settings
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setDefaultTimeout(10000);
-    await page.setDefaultNavigationTimeout(15000);
-
-    // Aggressive request filtering for better performance
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const resourceType = req.resourceType();
-      const url = req.url();
-
-      // Block unnecessary resources more aggressively
-      if (
-        [
-          "image",
-          "stylesheet",
-          "font",
-          "media",
-          "websocket",
-          "texttrack",
-          "eventsource",
-          "manifest",
-        ].includes(resourceType) ||
-        url.includes("analytics") ||
-        url.includes("tracking") ||
-        url.includes("ads") ||
-        url.includes("facebook") ||
-        url.includes("google-analytics")
-      ) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    // Disable unnecessary features
-    await page.evaluateOnNewDocument(() => {
-      // Disable images
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-
-      // Mock console to reduce overhead
-      if (window.location.hostname !== "localhost") {
-        console.log = console.warn = console.info = console.debug = () => {};
-      }
-    });
-
-    Logger.perf("New page creation", Date.now() - startTime);
-    return { page, browserInstance, fromPool: false };
-  } catch (error) {
-    browserInstance.activePagesCount--;
-    throw error;
-  }
-}
-
-// Optimized page cleanup
-async function releasePage(page, browserInstance, reuse = true) {
-  try {
-    if (browserInstance) {
-      browserInstance.activePagesCount--;
-    }
-
-    if (reuse && pagePool.length < MAX_PAGE_POOL_SIZE) {
-      // Clear page state but keep it for reuse
-      await page.evaluate(() => {
-        // Clear all timers and intervals
-        const maxId = setTimeout(() => {}, 0);
-        for (let i = 0; i < maxId; i++) {
-          clearTimeout(i);
-          clearInterval(i);
-        }
-
-        // Clear DOM
-        if (document.body) {
-          document.body.innerHTML = "";
-        }
+    
+    // Trigger garbage collection for long requests
+    if (duration > 10000 && global.gc) {
+      setImmediate(() => {
+        global.gc();
+        Logger.info("Garbage collection triggered after long request");
       });
+    }
+  });
+  
+  next();
+});
 
-      pagePool.push(page);
-    } else {
-      await page.close();
+// Memory management
+const cleanupInterval = setInterval(() => {
+  // Clean up old pages in the pool
+  const now = Date.now();
+  const maxPageAge = 10 * 60 * 1000; // 10 minutes
+  
+  availablePages = availablePages.filter(pageInfo => {
+    if (now - pageInfo.lastUsed > maxPageAge) {
+      try {
+        pageInfo.page.close();
+        Logger.info(`Closed aged page from browser ${pageInfo.browserId}`);
+        return false;
+      } catch (error) {
+        Logger.error("Error closing aged page:", error.message);
+        return false;
+      }
     }
+    return true;
+  });
+  
+  // Update metrics
+  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+  
+  // Force garbage collection if memory usage is high
+  if (global.gc && process.memoryUsage().heapUsed > 500 * 1024 * 1024) { // > 500MB
+    global.gc();
+    Logger.info("Garbage collection triggered due to high memory usage");
+  }
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// Clear cleanup interval on shutdown
+process.on('exit', () => {
+  clearInterval(cleanupInterval);
+});
+
+// Cache warming functionality
+async function warmCache() {
+  Logger.info("Starting cache warming...");
+  
+  try {
+    // Warm up exchange rates
+    await Promise.allSettled([getEuroConverts(), getUsdConverts()]);
+    
+    // Warm up random cars cache for different quantities
+    const warmUpSizes = [5, 10, 20];
+    for (const size of warmUpSizes) {
+      try {
+        await getRandomCars(size);
+        Logger.info(`Cache warmed for ${size} random cars`);
+      } catch (error) {
+        Logger.error(`Failed to warm cache for ${size} cars:`, error.message);
+      }
+    }
+    
+    Logger.info("Cache warming completed");
   } catch (error) {
-    Logger.warn("Error releasing page:", error.message);
-    try {
-      await page.close();
-    } catch (e) {
-      /* ignore */
-    }
+    Logger.error("Cache warming failed:", error.message);
   }
 }
 
-// Ultra-fast car URL extraction with minimal DOM interaction
-async function getRandomCarsOptimized(numberOfCars) {
-  const startTime = Date.now();
-  const cacheKey = `carUrls_${numberOfCars}`;
+// Schedule cache warming
+const cacheWarmingInterval = setInterval(warmCache, 30 * 60 * 1000); // Every 30 minutes
 
-  // Check cache first
-  const cachedUrls = cache.get(cacheKey);
-  if (cachedUrls) {
-    Logger.perf("Car URLs cache hit", Date.now() - startTime);
-    return cachedUrls;
+// Clear cache warming interval on shutdown
+process.on('exit', () => {
+  clearInterval(cacheWarmingInterval);
+});
+
+// Enhanced browser pool management
+async function initializeBrowserPool() {
+  Logger.info("Initializing browser pool...");
+  
+  for (let i = 0; i < BROWSER_POOL_SIZE; i++) {
+    try {
+      const browser = await launchOptimizedBrowser();
+      browserPool.push({
+        browser,
+        pages: [],
+        id: i,
+        createdAt: Date.now(),
+        lastUsed: Date.now()
+      });
+      
+      // Pre-create pages for each browser
+      for (let j = 0; j < MAX_PAGES_PER_BROWSER; j++) {
+        const page = await createOptimizedPage(browser);
+        availablePages.push({
+          page,
+          browserId: i,
+          createdAt: Date.now(),
+          lastUsed: Date.now()
+        });
+      }
+      
+      Logger.info(`Browser ${i} initialized with ${MAX_PAGES_PER_BROWSER} pages`);
+    } catch (error) {
+      Logger.error(`Failed to initialize browser ${i}:`, error.message);
+    }
   }
+  
+  performanceMetrics.browserPoolStats.activeBrowsers = browserPool.length;
+  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+  
+  Logger.info(`Browser pool initialized: ${browserPool.length} browsers, ${availablePages.length} pages`);
+}
 
-  const pageResult = await getOptimizedPage();
-  const { page, browserInstance } = pageResult;
+// Optimized browser launch with better configuration
+async function launchOptimizedBrowser() {
+  const chromiumPaths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    null, // Let Puppeteer find its own browser
+  ].filter((path) => path !== undefined);
 
+  for (const executablePath of chromiumPaths) {
+    try {
+      Logger.info(`Launching optimized browser with path: ${executablePath}`);
+
+      const launchOptions = {
+        headless: "new",
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-web-security",
+          "--disable-features=VizDisplayCompositor",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-default-apps",
+          "--disable-extensions",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-renderer-backgrounding",
+          "--disable-background-networking",
+          "--disable-background-media-processing",
+          "--disable-hang-monitor",
+          "--disable-client-side-phishing-detection",
+          "--disable-popup-blocking",
+          "--disable-sync",
+          "--disable-translate",
+          "--disable-component-update",
+          "--memory-pressure-off",
+          "--max_old_space_size=4096"
+        ],
+        timeout: 30000,
+        ignoreDefaultArgs: ['--disable-extensions'],
+        defaultViewport: {
+          width: 1366,
+          height: 768
+        }
+      };
+
+      if (executablePath) {
+        launchOptions.executablePath = executablePath;
+      }
+
+      const browser = await puppeteer.launch(launchOptions);
+      Logger.info(`Optimized browser launched successfully with path: ${executablePath}`);
+      return browser;
+    } catch (error) {
+      Logger.error(`Failed to launch browser with path ${executablePath}:`, error.message);
+    }
+  }
+  
+  throw new BrowserLaunchError("Failed to launch browser with all available paths", null);
+}
+
+// Create optimized page with enhanced settings
+async function createOptimizedPage(browser) {
+  const page = await browser.newPage();
+  
+  // Set aggressive timeouts for faster operation
+  page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(20000);
+  
+  // Enhanced request interception for maximum speed
+  await page.setRequestInterception(true);
+  
+  // Create a more comprehensive blocklist
+  const blockedDomains = new Set([
+    'google-analytics.com',
+    'googletagmanager.com',
+    'facebook.com',
+    'doubleclick.net',
+    'googlesyndication.com',
+    'adsystem.com',
+    'amazon-adsystem.com',
+    'criteo.com',
+    'outbrain.com',
+    'taboola.com',
+    'addthis.com',
+    'sharethis.com',
+    'hotjar.com',
+    'fullstory.com',
+    'crazyegg.com'
+  ]);
+  
+  const blockedResourceTypes = new Set([
+    'image', 'stylesheet', 'font', 'media', 'websocket', 
+    'manifest', 'other', 'eventsource'
+  ]);
+  
+  const blockedKeywords = new Set([
+    'ads', 'analytics', 'tracking', 'gtm', 'pixel', 
+    'beacon', 'metrics', 'telemetry', 'social'
+  ]);
+  
+  page.on("request", (req) => {
+    try {
+      const resourceType = req.resourceType();
+      const url = req.url().toLowerCase();
+      
+      // Block by resource type
+      if (blockedResourceTypes.has(resourceType)) {
+        req.abort();
+        return;
+      }
+      
+      // Block by domain
+      const hostname = new URL(url).hostname;
+      if (blockedDomains.has(hostname)) {
+        req.abort();
+        return;
+      }
+      
+      // Block by URL keywords
+      if ([...blockedKeywords].some(keyword => url.includes(keyword))) {
+        req.abort();
+        return;
+      }
+      
+      // Block large files that might slow down the process
+      if (url.includes('.mp4') || url.includes('.avi') || 
+          url.includes('.mov') || url.includes('.pdf') ||
+          url.includes('.zip') || url.includes('.exe')) {
+        req.abort();
+        return;
+      }
+      
+      req.continue();
+    } catch (error) {
+      Logger.error("Request interception error:", error.message);
+      try {
+        req.continue();
+      } catch (e) {
+        // Request might already be handled
+      }
+    }
+  });
+  
+  // Disable images and CSS for faster loading
+  await page.setRequestInterception(true);
+  
+  // Set user agent to avoid bot detection
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+  
+  // Optimize page settings
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    });
+  });
+  
+  return page;
+}
+
+// Get page from pool with automatic management
+async function getPageFromPool() {
+  const startTime = Date.now();
+  
+  if (availablePages.length === 0) {
+    Logger.warn("No available pages in pool, creating new page...");
+    
+    // Try to get a browser with available capacity
+    const availableBrowser = browserPool.find(b => b.pages.length < MAX_PAGES_PER_BROWSER);
+    if (availableBrowser) {
+      const page = await createOptimizedPage(availableBrowser.browser);
+      const pageInfo = {
+        page,
+        browserId: availableBrowser.id,
+        createdAt: Date.now(),
+        lastUsed: Date.now()
+      };
+      
+      availableBrowser.pages.push(pageInfo);
+      Logger.perf("New page created", Date.now() - startTime);
+      return pageInfo;
+    } else {
+      throw new Error("Browser pool exhausted");
+    }
+  }
+  
+  const pageInfo = availablePages.pop();
+  pageInfo.lastUsed = Date.now();
+  busyPages.add(pageInfo);
+  
+  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+  performanceMetrics.browserPoolStats.busyPages = busyPages.size;
+  
+  Logger.perf("Page acquired from pool", Date.now() - startTime);
+  return pageInfo;
+}
+
+// Return page to pool
+function returnPageToPool(pageInfo) {
+  busyPages.delete(pageInfo);
+  pageInfo.lastUsed = Date.now();
+  availablePages.push(pageInfo);
+  
+  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+  performanceMetrics.browserPoolStats.busyPages = busyPages.size;
+}
+
+// Enhanced browser launch with retry logic and multiple fallback paths
+async function launchBrowser() {
+  // Use browser pool instead
+  if (browserPool.length === 0) {
+    await initializeBrowserPool();
+  }
+  
+  return browserPool[0]?.browser;
+}
+
+// Enhanced page creation with error handling
+async function getPage() {
   try {
-    const randomPage = Math.floor(Math.random() * 10) + 1; // Reduce range for faster response
+    const pageInfo = await getPageFromPool();
+    return pageInfo.page;
+  } catch (error) {
+    Logger.error("Failed to get page from pool:", error.message);
+    throw error;
+  }
+}
+
+// Enhanced random cars fetching with comprehensive error handling and caching
+async function getRandomCars(numberOfCars) {
+  const cacheKey = `randomCars_${numberOfCars}`;
+  const cachedResult = cache.get(cacheKey);
+  
+  if (cachedResult) {
+    performanceMetrics.cacheHits++;
+    Logger.info(`Cache hit for random cars (${numberOfCars})`);
+    return cachedResult;
+  }
+  
+  performanceMetrics.cacheMisses++;
+  let pageInfo;
+  
+  try {
+    pageInfo = await getPageFromPool();
+    const page = pageInfo.page;
+    const randomPage = Math.floor(Math.random() * 20) + 1;
     const url = `https://turbo.az/autos?pages=${randomPage}`;
 
     Logger.info(`Fetching car URLs from page ${randomPage}`);
 
-    // Navigate with minimal waiting
+    const startTime = Date.now();
     await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: 15000,
+      timeout: 20000,
     });
 
-    // Extract URLs with minimal DOM queries
+    // Wait for content to load with reduced timeout
+    await page.waitForSelector(".products-i", { timeout: 8000 });
+
+
     const carUrls = await page.evaluate((numberOfCars) => {
       const links = document.querySelectorAll(".products-i__link");
       const urls = Array.from(links, (link) => link.href).filter(Boolean);
@@ -359,38 +578,50 @@ async function getRandomCarsOptimized(numberOfCars) {
       return result;
     }, numberOfCars);
 
-    // Cache for 5 minutes
-    cache.set(cacheKey, carUrls, 300);
+    Logger.perf(`Found ${carUrls.length} car URLs`, Date.now() - startTime);
+    
+    // Cache the result
+    cache.set(cacheKey, carUrls, 180); // Cache for 3 minutes
+    
 
-    Logger.perf("Car URLs extraction", Date.now() - startTime);
     return carUrls;
   } finally {
-    await releasePage(page, browserInstance);
+    if (pageInfo) {
+      returnPageToPool(pageInfo);
+    }
   }
 }
 
-// Highly optimized car info extraction
-async function getCarInfoOptimized(carUrl) {
-  const startTime = Date.now();
-  const cacheKey = `car_${carUrl}`;
-
+// Enhanced car info fetching with retry logic and caching
+async function getCarInfo(carUrl, retryCount = 0) {
+  const MAX_RETRIES = 2;
+  const cacheKey = `carInfo_${Buffer.from(carUrl).toString('base64').slice(0, 20)}`;
+  
   // Check cache first
-  const cachedInfo = cache.get(cacheKey);
-  if (cachedInfo) {
-    Logger.perf("Car info cache hit", Date.now() - startTime);
-    return cachedInfo;
+  const cachedResult = pageCache.get(cacheKey);
+  if (cachedResult) {
+    performanceMetrics.cacheHits++;
+    Logger.info(`Cache hit for car info: ${carUrl}`);
+    return cachedResult;
   }
-
-  const pageResult = await getOptimizedPage();
-  const { page, browserInstance } = pageResult;
+  
+  performanceMetrics.cacheMisses++;
+  let pageInfo;
 
   try {
+    pageInfo = await getPageFromPool();
+    const page = pageInfo.page;
+    Logger.info(`Fetching car info from: ${carUrl}`);
+
+    const startTime = Date.now();
     await page.goto(carUrl, {
       waitUntil: "domcontentloaded",
-      timeout: 15000,
+      timeout: 20000,
     });
 
-    // Extract all data in a single evaluate call to minimize context switches
+    // Wait for essential content with reduced timeout
+    await page.waitForSelector(".product-title", { timeout: 8000 });
+
     const carInfo = await page.evaluate(
       (USD_AZN, EURO_AZN) => {
         const getManatPrice = (priceText) => {
@@ -419,49 +650,78 @@ async function getCarInfoOptimized(carUrl) {
           }
         };
 
-        const getText = (selector) => {
-          const element = document.querySelector(selector);
-          return element ? element.textContent.trim() : "Unknown";
-        };
-
-        const getPropertyValue = (propertyName) => {
-          const element = document.querySelector(`[for='${propertyName}']`);
-          return element && element.nextSibling
-            ? element.nextSibling.textContent.trim()
-            : "Unknown";
-        };
-
-        // Extract images more efficiently
-        const imageElements = document.querySelectorAll(
-          ".slick-slide:not(.slick-cloned) img"
-        );
-        const images = Array.from(imageElements)
-          .map((img) => img.src)
-          .filter((src) => src && !src.startsWith("data:"))
-          .slice(0, 5); // Limit to 5 images for performance
-
-        return {
-          title: getText(".product-title").split(", ")[0] || "Unknown",
-          year: getText("[for='ad_reg_year']+span a"),
-          mileage: getPropertyValue("ad_mileage"),
-          engine: getPropertyValue("ad_engine_volume"),
-          transmission: getPropertyValue("ad_transmission"),
-          images,
-          price: getManatPrice(getText(".product-price__i")),
-          url: location.href,
-        };
+        try {
+          return {
+            title:
+              document
+                .querySelector(".product-title")
+                ?.textContent?.split(", ")[0] || "Unknown",
+            year:
+              document.querySelector(
+                ".product-properties__i-name[for='ad_reg_year']+span a"
+              )?.textContent || "Unknown",
+            mileage:
+              document
+                .querySelector(".product-properties__i-name[for='ad_mileage']")
+                ?.nextSibling?.textContent?.trim() || "Unknown",
+            engine:
+              document
+                .querySelector(
+                  ".product-properties__i-name[for='ad_engine_volume']"
+                )
+                ?.nextSibling?.textContent?.trim() || "Unknown",
+            transmission:
+              document
+                .querySelector(
+                  ".product-properties__i-name[for='ad_transmission']"
+                )
+                ?.nextSibling?.textContent?.trim() || "Unknown",
+            images: [
+              ...document.querySelectorAll(
+                ".slick-slide:not(.slick-cloned) img"
+              ),
+            ]
+              .map((elem) => elem.src)
+              .filter((src) => src && !src.includes("data:image"))
+              .slice(0, 5), // Limit to 5 images for performance
+            price:
+              getManatPrice(
+                document.querySelector(".product-price__i")?.textContent
+              ) || "Unknown",
+            url: window.location.href,
+          };
+        } catch (error) {
+          console.error("Data extraction error:", error);
+          return {
+            error: "Failed to extract car data",
+            url: window.location.href,
+          };
+        }
       },
       USD_AZN,
       EURO_AZN
     );
 
-    // Cache for 10 minutes
-    cache.set(cacheKey, carInfo, 600);
-
-    Logger.perf("Car info extraction", Date.now() - startTime);
+    Logger.perf(`Successfully fetched car info: ${carInfo.title}`, Date.now() - startTime);
+    
+    // Cache successful results
+    if (!carInfo.error) {
+      pageCache.set(cacheKey, carInfo, 300); // Cache for 5 minutes
+    }
+    
     return carInfo;
   } catch (error) {
-    Logger.error(`Car info extraction failed for ${carUrl}:`, error.message);
+    Logger.error(
+      `Error fetching car info (attempt ${retryCount + 1}):`,
+      error.message
+    );
+
+    if (retryCount < MAX_RETRIES) {
+      Logger.info(`Retrying car info fetch for ${carUrl}...`);
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Reduced wait time
+      return getCarInfo(carUrl, retryCount + 1);
+    }
+
     return {
       error: "Failed to fetch car details",
       url: carUrl,
@@ -474,7 +734,10 @@ async function getCarInfoOptimized(carUrl) {
       price: "Unknown",
     };
   } finally {
-    await releasePage(page, browserInstance);
+    if (pageInfo) {
+      returnPageToPool(pageInfo);
+    }
+
   }
 }
 
@@ -549,21 +812,62 @@ app.get("/get-random-cars", async (req, res) => {
     }
 
     // Process cars with optimized concurrency
-    const infoFetchStart = Date.now();
-    const OPTIMAL_CONCURRENCY = Math.min(8, carUrls.length); // Increased concurrency
-    const carInfoPromises = [];
+    const BATCH_SIZE = Math.min(availablePages.length, 8); // Dynamic batch size based on available pages
+    const carInfos = [];
+    const processingStartTime = Date.now();
 
-    // Process in batches with higher concurrency
-    for (let i = 0; i < carUrls.length; i += OPTIMAL_CONCURRENCY) {
-      const batch = carUrls.slice(i, i + OPTIMAL_CONCURRENCY);
-      const batchPromises = batch.map((url) => getCarInfoOptimized(url));
-      carInfoPromises.push(...batchPromises);
+    Logger.info(`Processing ${cars.length} cars with batch size ${BATCH_SIZE}`);
 
-      // Small delay between batches to prevent overwhelming
-      if (i + OPTIMAL_CONCURRENCY < carUrls.length) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+    for (let i = 0; i < cars.length; i += BATCH_SIZE) {
+      const batch = cars.slice(i, i + BATCH_SIZE);
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(cars.length / BATCH_SIZE);
+      
+      Logger.info(`Processing batch ${batchNum}/${totalBatches} (${batch.length} cars)`);
+
+      const batchStartTime = Date.now();
+      const batchResults = await Promise.allSettled(
+        batch.map((car, index) => {
+          return Promise.race([
+            getCarInfo(car),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Timeout')), 25000) // 25 second timeout per car
+            )
+          ]);
+        })
+      );
+
+      batchResults.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          carInfos.push(result.value);
+        } else {
+          Logger.error(
+            `Failed to process car ${batch[index]}:`,
+            result.reason?.message
+          );
+          carInfos.push({
+            error: "Failed to fetch car details",
+            url: batch[index] || "Unknown",
+            title: "Unknown",
+            year: "Unknown",
+            mileage: "Unknown",
+            engine: "Unknown",
+            transmission: "Unknown",
+            images: [],
+            price: "Unknown",
+          });
+        }
+      });
+
+      Logger.perf(`Batch ${batchNum} completed`, Date.now() - batchStartTime);
+
+      // Reduced delay between batches for faster processing
+      if (i + BATCH_SIZE < cars.length) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
+    
+    Logger.perf(`Total processing completed`, Date.now() - processingStartTime);
 
     const carInfoResults = await Promise.allSettled(carInfoPromises);
     const carInfos = carInfoResults.map((result) =>
@@ -596,14 +900,81 @@ app.get("/get-random-cars", async (req, res) => {
       cache.set(fullCacheKey, response, 180); // 3 minutes cache
     }
 
-    Logger.perf("Total request", Date.now() - requestStart);
-    Logger.info(
-      `Successfully processed ${successfulCars.length}/${
-        carUrls.length
-      } cars in ${Date.now() - requestStart}ms`
-    );
+// Enhanced metrics endpoint
+app.get("/metrics", async (req, res) => {
+  try {
+    const memoryUsage = process.memoryUsage();
+    const cpuUsage = process.cpuUsage();
+    
+    res.json({
+      timestamp: new Date().toISOString(),
+      memory: {
+        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024), // MB
+        heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024), // MB
+        external: Math.round(memoryUsage.external / 1024 / 1024), // MB
+        rss: Math.round(memoryUsage.rss / 1024 / 1024), // MB
+      },
+      cpu: {
+        user: Math.round(cpuUsage.user / 1000), // ms
+        system: Math.round(cpuUsage.system / 1000), // ms
+      },
+      performance: performanceMetrics,
+      browserPool: {
+        totalBrowsers: browserPool.length,
+        availablePages: availablePages.length,
+        busyPages: busyPages.size,
+        totalPages: availablePages.length + busyPages.size,
+      },
+      cache: {
+        mainCache: {
+          keys: cache.keys().length,
+          stats: cache.getStats(),
+        },
+        pageCache: {
+          keys: pageCache.keys().length,
+          stats: pageCache.getStats(),
+        }
+      },
+      uptime: Math.round(process.uptime()),
+    });
+  } catch (error) {
+    Logger.error("Metrics endpoint error:", error.message);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
+});
 
-    res.json(response);
+// Health check endpoint
+app.get("/health", async (req, res) => {
+  try {
+    const browserStatus =
+      browserPool.length > 0 && browserPool[0]?.browser && !browserPool[0]?.browser.disconnected ? "running" : "stopped";
+
+    const memoryUsage = process.memoryUsage();
+    const isHealthy = memoryUsage.heapUsed < 1024 * 1024 * 1024 && // < 1GB
+                     browserPool.length > 0 &&
+                     performanceMetrics.errorCount < 100;
+
+    res.status(isHealthy ? 200 : 503).json({
+      status: isHealthy ? "ok" : "degraded",
+      timestamp: new Date().toISOString(),
+      browser: browserStatus,
+      cache: {
+        keys: cache.keys().length,
+        stats: cache.getStats(),
+      },
+      exchangeRates: {
+        USD_AZN,
+        EURO_AZN,
+      },
+      performance: performanceMetrics,
+      memory: {
+        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024), // MB
+        isHealthy: memoryUsage.heapUsed < 1024 * 1024 * 1024
+      }
+    });
   } catch (error) {
     Logger.error("Critical error in /get-random-cars:", error.message);
 
@@ -615,24 +986,22 @@ app.get("/get-random-cars", async (req, res) => {
   }
 });
 
-// Lightweight health check
-app.get("/health", (req, res) => {
-  const healthData = {
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    browserPool: browserPool.length,
-    activeBrowsers: browserPool.filter((b) => !b.browser.disconnected).length,
-    cache: {
-      keys: cache.keys().length,
-      hits: cache.getStats().hits,
-      misses: cache.getStats().misses,
-    },
-    exchangeRates: { USD_AZN, EURO_AZN },
-    memory: process.memoryUsage(),
-    uptime: process.uptime(),
-  };
+// Graceful shutdown handling
+process.on("SIGTERM", async () => {
+  Logger.info("SIGTERM received, shutting down gracefully...");
+  try {
+    for (const browserInfo of browserPool) {
+      if (browserInfo.browser) {
+        await browserInfo.browser.close();
+        Logger.info(`Browser ${browserInfo.id} closed successfully`);
+      }
+    }
+    Logger.info("All browsers closed successfully");
+  } catch (error) {
+    Logger.error("Error during shutdown:", error.message);
+  }
+  process.exit(0);
 
-  res.json(healthData);
 });
 
 // Cleanup endpoint for manual cache clearing
@@ -647,24 +1016,12 @@ async function gracefulShutdown(signal) {
   Logger.info(`${signal} received, shutting down gracefully...`);
 
   try {
-    // Close all pages in pool
-    await Promise.all(
-      pagePool.map((page) =>
-        page
-          .close()
-          .catch((e) => Logger.warn("Error closing pooled page:", e.message))
-      )
-    );
-
-    // Close all browsers
-    await Promise.all(
-      browserPool.map(({ browser }) =>
-        browser
-          .close()
-          .catch((e) => Logger.warn("Error closing browser:", e.message))
-      )
-    );
-
+    for (const browserInfo of browserPool) {
+      if (browserInfo.browser) {
+        await browserInfo.browser.close();
+        Logger.info(`Browser ${browserInfo.id} closed successfully`);
+      }
+    }
     Logger.info("All browsers closed successfully");
   } catch (error) {
     Logger.error("Error during shutdown:", error.message);
@@ -686,50 +1043,77 @@ process.on("uncaughtException", (error) => {
   gracefulShutdown("UNCAUGHT_EXCEPTION");
 });
 
-// Background tasks
-setInterval(() => {
-  updateExchangeRates().catch((err) =>
-    Logger.warn("Background exchange rate update failed:", err.message)
-  );
-}, 3600000); // Update every hour
-
-// Browser health check and restart if needed
-setInterval(() => {
-  browserPool.forEach(async ({ browser }, index) => {
-    try {
-      if (browser.disconnected) {
-        Logger.warn(`Browser ${index} disconnected, restarting...`);
-        const newBrowser = await launchOptimizedBrowser();
-        browserPool[index] = {
-          browser: newBrowser,
-          activePagesCount: 0,
-          lastUsed: Date.now(),
-        };
-      }
-    } catch (error) {
-      Logger.error(`Failed to restart browser ${index}:`, error.message);
+// Cache management endpoint
+app.post("/cache/clear", (req, res) => {
+  try {
+    const type = req.body.type || 'all';
+    
+    if (type === 'all' || type === 'main') {
+      cache.flushAll();
+      Logger.info("Main cache cleared");
     }
-  });
-}, 300000); // Check every 5 minutes
+    
+    if (type === 'all' || type === 'page') {
+      pageCache.flushAll();
+      Logger.info("Page cache cleared");
+    }
+    
+    res.json({
+      status: "success",
+      message: `${type} cache cleared`,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    Logger.error("Cache clear error:", error.message);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
 
-// Server startup
+// Warm cache endpoint
+app.post("/cache/warm", async (req, res) => {
+  try {
+    await warmCache();
+    res.json({
+      status: "success",
+      message: "Cache warming completed",
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    Logger.error("Cache warming error:", error.message);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+// Server startup with enhanced error handling
 app.listen(PORT, async () => {
   try {
     Logger.info(`🚀 Starting optimized server on port ${PORT}...`);
 
     // Initialize browser pool
     await initializeBrowserPool();
-    Logger.info(
-      `✅ Browser pool initialized with ${browserPool.length} instances`
-    );
+    Logger.info("Browser pool initialized successfully");
 
     // Initialize exchange rates
     await updateExchangeRates();
     Logger.info("✅ Exchange rates initialized");
 
-    Logger.info(`🎯 Server ready at http://localhost:${PORT}`);
-    Logger.info(`📊 Health check: http://localhost:${PORT}/health`);
-    Logger.info(`🏎️  Ready to serve optimized car data!`);
+    // Initial cache warming
+    setImmediate(() => {
+      warmCache().catch(error => 
+        Logger.error("Initial cache warming failed:", error.message)
+      );
+    });
+
+    Logger.info(`[SERVER] ExpressJS is listening on http://localhost:${PORT}`);
+    Logger.info("Health check available at: /health");
+    Logger.info("Metrics available at: /metrics");
+    Logger.info("Cache management available at: /cache/clear and /cache/warm");
   } catch (error) {
     Logger.error("❌ Server startup failed:", error.message);
     process.exit(1);
