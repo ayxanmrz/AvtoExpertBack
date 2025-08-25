@@ -4,18 +4,65 @@ import cors from "cors";
 import NodeCache from "node-cache";
 import axios from "axios";
 import dotenv from "dotenv";
-import { Worker } from "worker_threads";
-import { promisify } from "util";
 import compression from "compression";
-import cluster from "cluster";
-import os from "os";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import { MongoClient, ServerApiVersion } from "mongodb";
 
 dotenv.config();
 
 const PORT = 4000;
 const app = express();
+
+const MONGO_URI = process.env.MONGO_URI;
+
+console.log(`Connecting to MongoDB at ${MONGO_URI}`);
+
+const client = new MongoClient(MONGO_URI, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+let carDataCollection;
+
+async function connectDB() {
+  try {
+    await client.connect();
+    const database = client.db("cardb");
+    // Send a ping to confirm a successful connection
+    carDataCollection = database.collection("car_datas");
+    console.log(
+      "Pinged your deployment. You successfully connected to MongoDB!"
+    );
+  } catch (error) {
+    console.error("Error connecting to MongoDB:", error);
+    throw new Error("Database connection failed");
+  }
+}
+
+async function insertCars(carDatas) {
+  try {
+    const result = await carDataCollection.insertMany(carDatas, {
+      ordered: false,
+    });
+    console.log(
+      "Inserted:",
+      result.insertedCount,
+      "documents into the collection"
+    );
+  } catch (err) {
+    if (err.code === 11000) {
+      console.log("Some duplicates were skipped.");
+    } else {
+      throw err;
+    }
+  }
+}
+
+await connectDB();
 
 // Enhanced caching with multiple layers
 const cache = new NodeCache({
@@ -37,9 +84,6 @@ const MAX_PAGES_PER_BROWSER = 10;
 let browserPool = [];
 let availablePages = [];
 let busyPages = new Set();
-
-let EURO_AZN = 1.8; // Default fallback values
-let USD_AZN = 1.7;
 let browserLaunchAttempts = 0;
 const MAX_BROWSER_LAUNCH_ATTEMPTS = 3;
 const BROWSER_RETRY_DELAY = 5000; // 5 seconds
@@ -210,19 +254,11 @@ const cleanupInterval = setInterval(() => {
   }
 }, 5 * 60 * 1000); // Every 5 minutes
 
-// Clear cleanup interval on shutdown
-process.on("exit", () => {
-  clearInterval(cleanupInterval);
-});
-
 // Cache warming functionality
 async function warmCache() {
   Logger.info("Starting cache warming...");
 
   try {
-    // Warm up exchange rates
-    await Promise.allSettled([getEuroConverts(), getUsdConverts()]);
-
     // Warm up random cars cache for different quantities
     const warmUpSizes = [5, 10, 20];
     for (const size of warmUpSizes) {
@@ -531,36 +567,15 @@ function returnPageToPool(pageInfo) {
   performanceMetrics.browserPoolStats.busyPages = busyPages.size;
 }
 
-// Enhanced browser launch with retry logic and multiple fallback paths
-async function launchBrowser() {
-  // Use browser pool instead
-  if (browserPool.length === 0) {
-    await initializeBrowserPool();
-  }
-
-  return browserPool[0]?.browser;
-}
-
-// Enhanced page creation with error handling
-async function getPage() {
-  try {
-    const pageInfo = await getPageFromPool();
-    return pageInfo.page;
-  } catch (error) {
-    Logger.error("Failed to get page from pool:", error.message);
-    throw error;
-  }
-}
-
 // Enhanced random cars fetching with comprehensive error handling and caching
-async function getRandomCars(numberOfCars) {
+async function getRandomCars(numberOfCars, useCache = true) {
   const cacheKey = `randomCars_${numberOfCars}`;
-  const cachedResult = cache.get(cacheKey);
+  const cachedResult = useCache ? cache.get(cacheKey) : null;
 
   if (cachedResult) {
     performanceMetrics.cacheHits++;
     Logger.info(`Cache hit for random cars (${numberOfCars})`);
-    return cachedResult;
+    return { result: cachedResult, isCached: true };
   }
 
   performanceMetrics.cacheMisses++;
@@ -569,7 +584,7 @@ async function getRandomCars(numberOfCars) {
   try {
     pageInfo = await getPageFromPool();
     const page = pageInfo.page;
-    const randomPage = Math.floor(Math.random() * 20) + 1;
+    const randomPage = Math.floor(Math.random() * 1000) + 1;
     const url = `https://turbo.az/autos?pages=${randomPage}`;
 
     Logger.info(`Fetching random cars from page ${randomPage}`);
@@ -599,7 +614,7 @@ async function getRandomCars(numberOfCars) {
     // Cache the result
     cache.set(cacheKey, carUrls, 180); // Cache for 3 minutes
 
-    return carUrls;
+    return { result: carUrls, isCached: false };
   } catch (error) {
     Logger.error("Error fetching random cars:", error.message);
     throw new PageProcessingError(
@@ -645,85 +660,56 @@ async function getCarInfo(carUrl, retryCount = 0) {
     // Wait for essential content with reduced timeout
     await page.waitForSelector(".product-title", { timeout: 8000 });
 
-    const carInfo = await page.evaluate(
-      (USD_AZN, EURO_AZN) => {
-        const getManatPrice = (string) => {
-          try {
-            if (!string) return null;
-            const stringList = string.split(" ");
-            const currency = stringList[stringList.length - 1];
-            const value = stringList
-              .slice(0, stringList.length - 1)
-              .reduce((res, elem) => res + elem.replace(",", ""), "");
-
-            const numValue = parseFloat(value);
-            if (isNaN(numValue)) return null;
-
-            if (currency === "AZN") {
-              return numValue;
-            } else if (currency === "USD") {
-              return Math.round(numValue * (USD_AZN || 1.7));
-            } else if (currency === "EUR") {
-              return Math.round(numValue * (EURO_AZN || 1.8));
-            }
-            return null;
-          } catch (error) {
-            console.error("Price parsing error:", error);
-            return null;
-          }
+    const carInfo = await page.evaluate(() => {
+      try {
+        return {
+          car_id: window.location.href.slice(23, 30),
+          title:
+            document
+              .querySelector(".product-title")
+              ?.textContent?.split(", ")[0] || "Unknown",
+          year:
+            document.querySelector(
+              ".product-properties__i-name[for='ad_reg_year']+span a"
+            )?.textContent || "Unknown",
+          mileage:
+            document
+              .querySelector(".product-properties__i-name[for='ad_mileage']")
+              ?.nextSibling?.textContent?.trim() || "Unknown",
+          engine:
+            document
+              .querySelector(
+                ".product-properties__i-name[for='ad_engine_volume']"
+              )
+              ?.nextSibling?.textContent?.trim() || "Unknown",
+          transmission:
+            document
+              .querySelector(
+                ".product-properties__i-name[for='ad_transmission']"
+              )
+              ?.nextSibling?.textContent?.trim() || "Unknown",
+          images: [
+            ...document.querySelectorAll(".slick-slide:not(.slick-cloned) img"),
+          ]
+            .map((elem) => elem.src)
+            .filter((src) => src && !src.includes("data:image"))
+            .slice(0, 5), // Limit to 5 images for performance
+          price:
+            Number(
+              document
+                .querySelector(".product-price__i")
+                ?.textContent.replace(/[^\d]/g, "")
+            ) || "Unknown",
+          url: window.location.href,
         };
-
-        try {
-          return {
-            title:
-              document
-                .querySelector(".product-title")
-                ?.textContent?.split(", ")[0] || "Unknown",
-            year:
-              document.querySelector(
-                ".product-properties__i-name[for='ad_reg_year']+span a"
-              )?.textContent || "Unknown",
-            mileage:
-              document
-                .querySelector(".product-properties__i-name[for='ad_mileage']")
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            engine:
-              document
-                .querySelector(
-                  ".product-properties__i-name[for='ad_engine_volume']"
-                )
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            transmission:
-              document
-                .querySelector(
-                  ".product-properties__i-name[for='ad_transmission']"
-                )
-                ?.nextSibling?.textContent?.trim() || "Unknown",
-            images: [
-              ...document.querySelectorAll(
-                ".slick-slide:not(.slick-cloned) img"
-              ),
-            ]
-              .map((elem) => elem.src)
-              .filter((src) => src && !src.includes("data:image"))
-              .slice(0, 5), // Limit to 5 images for performance
-            price:
-              getManatPrice(
-                document.querySelector(".product-price__i")?.textContent
-              ) || "Unknown",
-            url: window.location.href,
-          };
-        } catch (error) {
-          console.error("Data extraction error:", error);
-          return {
-            error: "Failed to extract car data",
-            url: window.location.href,
-          };
-        }
-      },
-      USD_AZN,
-      EURO_AZN
-    );
+      } catch (error) {
+        console.error("Data extraction error:", error);
+        return {
+          error: "Failed to extract car data",
+          url: window.location.href,
+        };
+      }
+    });
 
     Logger.perf(
       `Successfully fetched car info: ${carInfo.title}`,
@@ -766,80 +752,26 @@ async function getCarInfo(carUrl, retryCount = 0) {
   }
 }
 
-// Enhanced currency fetching with fallbacks
-async function getEuroConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json",
-    "https://api.exchangerate-api.com/v4/latest/EUR",
-  ];
-
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching EUR/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        EURO_AZN = response.data.eur.azn;
-      } else {
-        EURO_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`EURO_AZN rate updated: ${EURO_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching EUR rate from ${apiUrl}:`, error.message);
-    }
-  }
-
-  Logger.warn(`Using fallback EUR/AZN rate: ${EURO_AZN}`);
-}
-
-async function getUsdConverts() {
-  const apis = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-    "https://api.exchangerate-api.com/v4/latest/USD",
-  ];
-
-  for (const apiUrl of apis) {
-    try {
-      Logger.info(`Fetching USD/AZN rate from: ${apiUrl}`);
-      const response = await axios.get(apiUrl, { timeout: 10000 });
-
-      if (apiUrl.includes("fawazahmed0")) {
-        USD_AZN = response.data.usd.azn;
-      } else {
-        USD_AZN = response.data.rates.AZN;
-      }
-
-      Logger.info(`USD_AZN rate updated: ${USD_AZN}`);
-      return;
-    } catch (error) {
-      Logger.error(`Error fetching USD rate from ${apiUrl}:`, error.message);
-    }
-  }
-
-  Logger.warn(`Using fallback USD/AZN rate: ${USD_AZN}`);
-}
-
-// Enhanced API endpoint with comprehensive error handling
-app.get("/get-random-cars", async (req, res) => {
+// ✅ Core logic (no req/res here, reusable everywhere)
+async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
   try {
-    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 50); // Limit max cars
+    const numberOfCars = Math.min(parseInt(number) || 20, 50); // Limit max cars
     Logger.info(`Processing request for ${numberOfCars} random cars`);
 
-    const cars = await getRandomCars(numberOfCars);
-    console.log(cars);
+    const callRandomCars = await getRandomCars(numberOfCars, useCache);
+    const cars = callRandomCars.result;
+    const isCarsCached = callRandomCars.isCached;
+    console.log("Is cars cached " + isCarsCached);
 
     if (cars.length === 0) {
       Logger.warn("No cars found");
-      return res.status(404).json({
+      return {
         error: "No cars found",
         message: "Unable to fetch car listings from the source",
-      });
+      };
     }
 
-    // Process cars with optimized concurrency
-    const BATCH_SIZE = Math.min(availablePages.length, 8); // Dynamic batch size based on available pages
+    const BATCH_SIZE = Math.min(availablePages.length, 8);
     const carInfos = [];
     const processingStartTime = Date.now();
 
@@ -859,15 +791,14 @@ app.get("/get-random-cars", async (req, res) => {
 
       const batchStartTime = Date.now();
       const batchResults = await Promise.allSettled(
-        batch.map((car, index) => {
-          return Promise.race([
+        batch.map((car) =>
+          Promise.race([
             getCarInfo(car),
-            new Promise(
-              (_, reject) =>
-                setTimeout(() => reject(new Error("Timeout")), 25000) // 25 second timeout per car
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("Timeout")), 25000)
             ),
-          ]);
-        })
+          ])
+        )
       );
 
       batchResults.forEach((result, index) => {
@@ -894,7 +825,6 @@ app.get("/get-random-cars", async (req, res) => {
 
       Logger.perf(`Batch ${batchNum} completed`, Date.now() - batchStartTime);
 
-      // Reduced delay between batches for faster processing
       if (i + BATCH_SIZE < cars.length) {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
@@ -907,12 +837,14 @@ app.get("/get-random-cars", async (req, res) => {
       `Successfully processed ${successfulCars.length}/${cars.length} cars`
     );
 
-    // Cache successful results
     if (successfulCars.length > 0) {
       cache.set("randomCars", carInfos);
+      if (!isCarsCached) {
+        insertCars(successfulCars);
+      }
     }
 
-    res.json({
+    return {
       cars: carInfos,
       stats: {
         requested: numberOfCars,
@@ -920,6 +852,84 @@ app.get("/get-random-cars", async (req, res) => {
         processed: carInfos.length,
         successful: successfulCars.length,
         failed: carInfos.length - successfulCars.length,
+      },
+    };
+  } catch (error) {
+    Logger.error("Critical error in fetchCompleteCarDataCore:", error.message);
+
+    if (error instanceof BrowserLaunchError) {
+      return {
+        error: "Service temporarily unavailable",
+        message: "Browser service is not available. Please try again later.",
+        code: "BROWSER_UNAVAILABLE",
+      };
+    } else if (error instanceof PageProcessingError) {
+      return {
+        error: "External service error",
+        message: "Unable to fetch data from car listings website.",
+        code: "EXTERNAL_SERVICE_ERROR",
+      };
+    } else {
+      return {
+        error: "Internal server error",
+        message: "An unexpected error occurred while processing your request.",
+        code: "INTERNAL_ERROR",
+      };
+    }
+  }
+}
+
+async function fetchCompleteCarData(req, res) {
+  const result = await fetchCompleteCarDataCore({ number: req.query.number });
+  if (result.error) {
+    return res.status(500).json(result);
+  }
+  res.json(result);
+}
+
+app.get("/scrape-cars", fetchCompleteCarData);
+
+async function fetchCarDataFromDB(numberOfCars) {
+  try {
+    const N = Math.min(parseInt(numberOfCars) || 20, 50); // Limit max cars
+    const cars = await carDataCollection
+      .aggregate([{ $sample: { size: N } }])
+      .toArray();
+
+    if (cars.length === 0) {
+      Logger.warn("No cars found in database");
+      return [];
+    }
+
+    Logger.info(`Fetched ${cars.length} cars from database`);
+    return cars;
+  } catch (error) {
+    Logger.error("Error fetching cars from database:", error.message);
+    throw new Error("Database fetch failed");
+  }
+}
+
+// Enhanced API endpoint with comprehensive error handling
+app.get("/get-random-cars", async (req, res) => {
+  try {
+    const numberOfCars = Math.min(parseInt(req.query.number) || 20, 50); // Limit max cars
+    Logger.info(`Processing request for ${numberOfCars} random cars`);
+
+    const cars = await fetchCarDataFromDB(numberOfCars);
+
+    if (cars.length === 0) {
+      Logger.warn("No cars found");
+      return res.status(404).json({
+        error: "No cars found",
+        message: "Unable to fetch car listings from the source",
+      });
+    }
+
+    res.json({
+      cars: cars,
+      stats: {
+        requested: numberOfCars,
+        found: cars.length,
       },
     });
   } catch (error) {
@@ -1017,10 +1027,6 @@ app.get("/health", async (req, res) => {
         keys: cache.keys().length,
         stats: cache.getStats(),
       },
-      exchangeRates: {
-        USD_AZN,
-        EURO_AZN,
-      },
       performance: performanceMetrics,
       memory: {
         heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024), // MB
@@ -1056,6 +1062,7 @@ process.on("SIGTERM", async () => {
 process.on("SIGINT", async () => {
   Logger.info("SIGINT received, shutting down gracefully...");
   try {
+    await client.close();
     for (const browserInfo of browserPool) {
       if (browserInfo.browser) {
         await browserInfo.browser.close();
@@ -1136,10 +1143,6 @@ app.listen(PORT, async () => {
     await initializeBrowserPool();
     Logger.info("Browser pool initialized successfully");
 
-    // Initialize exchange rates
-    await Promise.allSettled([getEuroConverts(), getUsdConverts()]);
-    Logger.info("Exchange rates initialized");
-
     // Initial cache warming
     setImmediate(() => {
       warmCache().catch((error) =>
@@ -1162,4 +1165,47 @@ app.listen(PORT, async () => {
       );
     }
   }
+});
+
+async function deleteDuplicateCars() {
+  carDataCollection
+    .aggregate([
+      {
+        $group: {
+          _id: "$car_id",
+          latestId: { $max: "$_id" }, // keep the newest
+          dups: { $push: "$_id" },
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          dups: {
+            $filter: {
+              input: "$dups",
+              as: "id",
+              cond: { $ne: ["$$id", "$latestId"] },
+            },
+          },
+        },
+      },
+    ])
+    .forEach((doc) => {
+      if (doc.dups.length > 0) {
+        carDataCollection.deleteMany({ _id: { $in: doc.dups } });
+      }
+    });
+}
+
+const cleanupScrapeInterval = setInterval(() => {
+  Logger.info("Scraping 35 cars.");
+
+  fetchCompleteCarDataCore({ number: 35, useCache: false });
+}, 10 * 60 * 1000); // Every 10 minutes
+
+// Clear cleanup interval on shutdown
+process.on("exit", () => {
+  clearInterval(cleanupScrapeInterval);
+  clearInterval(cleanupInterval);
+  Logger.info("Cleanup intervals cleared and server shutting down gracefully.");
 });
