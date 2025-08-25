@@ -330,6 +330,7 @@ async function initializeBrowserPool() {
 async function launchOptimizedBrowser() {
   const chromiumPaths = [
     process.env.PUPPETEER_EXECUTABLE_PATH,
+    puppeteer.executablePath(),
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",

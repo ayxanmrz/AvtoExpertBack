@@ -1,73 +1,43 @@
-# Multi-stage build for optimal performance
+# Base image
 FROM node:18-alpine AS base
+RUN apk add --no-cache python3 make g++ git
 
-# Install dependencies for building native modules
-RUN apk add --no-cache python3 make g++
-
-# Create app directory
 WORKDIR /usr/src/app
 
 # Copy package files
 COPY package*.json ./
 
-# Production dependencies stage
-FROM base AS dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Development dependencies stage  
-FROM base AS dev-dependencies
+# Install dev dependencies (for build)
 RUN npm ci
 
-# Build stage
-FROM node:18-alpine AS build
-WORKDIR /usr/src/app
-COPY package*.json ./
-COPY --from=dev-dependencies /usr/src/app/node_modules ./node_modules
+# Copy source code
 COPY . .
 
-# Production stage
+# Build stage
+FROM base AS build
+RUN npm run build
+
+# Production image
 FROM node:18-alpine AS production
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
 
-# Install Chromium and required dependencies with minimal footprint
-RUN apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    freetype-dev \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    && rm -rf /var/cache/apk/*
+WORKDIR /usr/src/app
 
-# Create non-root user for security
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nextjs -u 1001
+# Copy production dependencies only
+COPY package*.json ./
+RUN npm ci --only=production
 
-# Set Puppeteer to use installed Chromium
+# Copy build output
+COPY --from=build /usr/src/app/dist ./dist
+
+# Puppeteer setup
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV NODE_ENV=production
-ENV NPM_CONFIG_CACHE=/tmp/.npm
 
-# Performance optimizations
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-
-WORKDIR /usr/src/app
-
-# Copy production dependencies
-COPY --from=dependencies --chown=nextjs:nodejs /usr/src/app/node_modules ./node_modules
-
-# Copy application code
-COPY --chown=nextjs:nodejs . .
-
-# Switch to non-root user
+# Non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
 USER nextjs
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:4000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"
-
 EXPOSE 4000
-
-# Use production start command
 CMD ["npm", "run", "prod"]
