@@ -1,43 +1,42 @@
 # Base image
-FROM node:18-alpine AS base
-RUN apk add --no-cache python3 make g++ git
+FROM node:18-alpine
 
+# Install dependencies for Puppeteer (Chromium)
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    python3 \
+    make \
+    g++ \
+    git
+
+# Create app directory
 WORKDIR /usr/src/app
 
-# Copy package files
+# Copy package.json and package-lock.json
 COPY package*.json ./
 
-# Install dev dependencies (for build)
-RUN npm ci
+# Install only production dependencies
+RUN npm ci --only=production && npm cache clean --force
 
-# Copy source code
+# Copy application source code
 COPY . .
-
-# Build stage
-FROM base AS build
-RUN npm run build
-
-# Production image
-FROM node:18-alpine AS production
-RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
-
-WORKDIR /usr/src/app
-
-# Copy production dependencies only
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Copy build output
-COPY --from=build /usr/src/app/dist ./dist
 
 # Puppeteer setup
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV NODE_ENV=production
 
-# Non-root user
+# Create non-root user
 RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
 USER nextjs
 
+# Expose app port
 EXPOSE 4000
+
+# Start server
 CMD ["npm", "run", "prod"]
