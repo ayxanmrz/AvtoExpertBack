@@ -28,7 +28,7 @@ if ! command -v pm2 &> /dev/null; then
 fi
 
 # Navigate to app directory
-cd /root/AvtoExpertSocket || exit
+cd /root/AvtoExpertBack || exit
 
 # Install production dependencies
 echo "📦 Installing npm dependencies..."
