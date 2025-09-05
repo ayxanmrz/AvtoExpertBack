@@ -33,13 +33,22 @@ cd /root/AvtoExpertBack || exit
 echo "📦 Installing npm dependencies..."
 npm ci --only=production
 
-# Start app with PM2
-echo "▶️ Starting app with PM2..."
+# Start car-scraper-app (Express API on 4000)
+echo "▶️ Starting car-scraper-app..."
+pm2 delete car-scraper-app || true
 pm2 start app.js --name "car-scraper-app"
-pm2 save
-pm2 startup systemd
 
-# Nginx config
+cd ../AvtoExpertSocket/ || exit
+
+# Start socket-app (Socket.IO server on 8000)
+echo "▶️ Starting socket-app..."
+pm2 delete socket-app || true
+pm2 start socket.js --name "socket-app"
+
+pm2 save
+pm2 startup systemd -u $USER --hp $HOME
+
+# Unified Nginx config
 echo "⚙️ Configuring Nginx..."
 sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOL
 server {
@@ -58,11 +67,21 @@ server {
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
+    # Express API (car-scraper-app)
     location / {
         proxy_pass http://localhost:4000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    # Socket.IO (socket-app)
+    location /socket.io/ {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -77,6 +96,7 @@ echo "🔐 Setting up SSL with Certbot..."
 sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m amirzeyev3@gmail.com
 
 echo "✅ Deployment finished!"
-echo "👉 API base: https://$DOMAIN/"
-echo "👉 Health check: https://$DOMAIN/health"
+echo "👉 API: https://$DOMAIN/"
+echo "👉 Health: https://$DOMAIN/health"
 echo "👉 Metrics: https://$DOMAIN/metrics"
+echo "👉 Socket.IO: wss://$DOMAIN/socket.io/"
