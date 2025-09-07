@@ -772,7 +772,7 @@ async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
       };
     }
 
-    const BATCH_SIZE = Math.min(availablePages.length, 8);
+    const BATCH_SIZE = Math.min(availablePages.length, 4);
     const carInfos = [];
     const processingStartTime = Date.now();
 
