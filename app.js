@@ -625,7 +625,15 @@ async function getRandomCars(numberOfCars, useCache = true) {
     );
   } finally {
     if (pageInfo) {
-      returnPageToPool(pageInfo);
+      try {
+        await pageInfo.page.isClosed();
+        returnPageToPool(pageInfo);
+      } catch (err) {
+        Logger.warn("Discarding invalid page, creating a fresh one...");
+        try {
+          await pageInfo.page.close();
+        } catch {}
+      }
     }
   }
 }
@@ -748,7 +756,15 @@ async function getCarInfo(carUrl, retryCount = 0) {
     };
   } finally {
     if (pageInfo) {
-      returnPageToPool(pageInfo);
+      try {
+        await pageInfo.page.isClosed();
+        returnPageToPool(pageInfo);
+      } catch (err) {
+        Logger.warn("Discarding invalid page, creating a fresh one...");
+        try {
+          await pageInfo.page.close();
+        } catch {}
+      }
     }
   }
 }
