@@ -79,8 +79,8 @@ const pageCache = new NodeCache({
 });
 
 // Browser pool configuration
-const BROWSER_POOL_SIZE = 3;
-const MAX_PAGES_PER_BROWSER = 10;
+const BROWSER_POOL_SIZE = 1;
+const MAX_PAGES_PER_BROWSER = 5;
 let browserPool = [];
 let availablePages = [];
 let busyPages = new Set();
