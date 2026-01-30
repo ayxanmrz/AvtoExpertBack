@@ -1,0 +1,36 @@
+node_modules
+npm-debug.log
+package-lock.json
+
+# Git
+.git
+.gitignore
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode
+.idea
+
+# Logs
+*.log
+
+# Documentation
+*.md
+
+# Deployment scripts
+deploy.sh
+deploy_ip.sh
+tempCodeRunnerFile.js
+
+# Docker files
+docker-compose*.yml
+.dockerignore
+
+# Build artifacts
+coverage

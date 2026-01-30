@@ -1,7 +1,7 @@
-# Base image
-FROM node:18-alpine
+# Base stage with common dependencies
+FROM node:20-alpine AS base
 
-# Install dependencies for Puppeteer (Chromium)
+# Install Chromium and required dependencies
 RUN apk add --no-cache \
     chromium \
     nss \
@@ -9,34 +9,48 @@ RUN apk add --no-cache \
     harfbuzz \
     ca-certificates \
     ttf-freefont \
-    python3 \
-    make \
-    g++ \
-    git
+    dumb-init
 
-# Create app directory
+# Set working directory
 WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json
-COPY package*.json ./
-
-# Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Copy application source code
-COPY . .
-
-# Puppeteer setup
+# Puppeteer configuration
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+# Dependencies stage
+FROM base AS dependencies
+COPY package*.json ./
+RUN npm ci --only=production --no-audit --prefer-offline && \
+    npm cache clean --force
+
+# Production stage
+FROM base AS production
+
 ENV NODE_ENV=production
 
 # Create non-root user
-RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
-USER nextjs
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Copy dependencies from dependencies stage
+COPY --from=dependencies --chown=nodejs:nodejs /usr/src/app/node_modules ./node_modules
+
+# Copy application source code
+COPY --chown=nodejs:nodejs . .
+
+# Switch to non-root user
+USER nodejs
 
 # Expose app port
 EXPOSE 4000
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:4000/health', (r) => {if (r.statusCode === 200) process.exit(0); process.exit(1);})" || exit 1
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["dumb-init", "--"]
+
 # Start server
-CMD ["npm", "run", "prod"]
+CMD ["node", "--max-old-space-size=4096", "--optimize-for-size", "app.js"]
