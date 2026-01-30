@@ -11,7 +11,7 @@ import { MongoClient, ServerApiVersion } from "mongodb";
 
 dotenv.config();
 
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 const app = express();
 
 const MONGO_URI = process.env.MONGO_URI;
@@ -35,7 +35,7 @@ async function connectDB() {
     // Send a ping to confirm a successful connection
     carDataCollection = database.collection("car_datas");
     console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+      "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } catch (error) {
     console.error("Error connecting to MongoDB:", error);
@@ -51,7 +51,7 @@ async function insertCars(carDatas) {
     console.log(
       "Inserted:",
       result.insertedCount,
-      "documents into the collection"
+      "documents into the collection",
     );
   } catch (err) {
     if (err.code === 11000) {
@@ -112,7 +112,7 @@ class Logger {
   static error(message, error = null) {
     console.error(
       `[ERROR] ${new Date().toISOString()} - ${message}`,
-      error || ""
+      error || "",
     );
     performanceMetrics.errorCount++;
   }
@@ -125,7 +125,7 @@ class Logger {
     console.log(
       `[PERF] ${new Date().toISOString()} - ${message}${
         duration ? ` (${duration}ms)` : ""
-      }`
+      }`,
     );
   }
 }
@@ -153,7 +153,7 @@ app.use(
   helmet({
     contentSecurityPolicy: false, // Disable CSP for API
     crossOriginEmbedderPolicy: false,
-  })
+  }),
 );
 
 // Rate limiting
@@ -181,7 +181,7 @@ app.use(
       }
       return compression.filter(req, res);
     },
-  })
+  }),
 );
 
 app.use(express.json({ limit: "1mb" }));
@@ -190,7 +190,7 @@ app.use(
     origin: [process.env.SOCKET_API, process.env.CLIENT_ORIGIN],
     credentials: true,
     optionsSuccessStatus: 200,
-  })
+  }),
 );
 
 // Performance monitoring middleware
@@ -207,7 +207,7 @@ app.use((req, res, next) => {
     if (duration > 5000) {
       // Log slow requests
       Logger.warn(
-        `Slow request detected: ${req.method} ${req.path} took ${duration}ms`
+        `Slow request detected: ${req.method} ${req.path} took ${duration}ms`,
       );
     }
 
@@ -224,35 +224,38 @@ app.use((req, res, next) => {
 });
 
 // Memory management
-const cleanupInterval = setInterval(() => {
-  // Clean up old pages in the pool
-  const now = Date.now();
-  const maxPageAge = 10 * 60 * 1000; // 10 minutes
+const cleanupInterval = setInterval(
+  () => {
+    // Clean up old pages in the pool
+    const now = Date.now();
+    const maxPageAge = 10 * 60 * 1000; // 10 minutes
 
-  availablePages = availablePages.filter((pageInfo) => {
-    if (now - pageInfo.lastUsed > maxPageAge) {
-      try {
-        pageInfo.page.close();
-        Logger.info(`Closed aged page from browser ${pageInfo.browserId}`);
-        return false;
-      } catch (error) {
-        Logger.error("Error closing aged page:", error.message);
-        return false;
+    availablePages = availablePages.filter((pageInfo) => {
+      if (now - pageInfo.lastUsed > maxPageAge) {
+        try {
+          pageInfo.page.close();
+          Logger.info(`Closed aged page from browser ${pageInfo.browserId}`);
+          return false;
+        } catch (error) {
+          Logger.error("Error closing aged page:", error.message);
+          return false;
+        }
       }
+      return true;
+    });
+
+    // Update metrics
+    performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+
+    // Force garbage collection if memory usage is high
+    if (global.gc && process.memoryUsage().heapUsed > 500 * 1024 * 1024) {
+      // > 500MB
+      global.gc();
+      Logger.info("Garbage collection triggered due to high memory usage");
     }
-    return true;
-  });
-
-  // Update metrics
-  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
-
-  // Force garbage collection if memory usage is high
-  if (global.gc && process.memoryUsage().heapUsed > 500 * 1024 * 1024) {
-    // > 500MB
-    global.gc();
-    Logger.info("Garbage collection triggered due to high memory usage");
-  }
-}, 5 * 60 * 1000); // Every 5 minutes
+  },
+  5 * 60 * 1000,
+); // Every 5 minutes
 
 // Cache warming functionality
 async function warmCache() {
@@ -311,7 +314,7 @@ async function initializeBrowserPool() {
       }
 
       Logger.info(
-        `Browser ${i} initialized with ${MAX_PAGES_PER_BROWSER} pages`
+        `Browser ${i} initialized with ${MAX_PAGES_PER_BROWSER} pages`,
       );
     } catch (error) {
       Logger.error(`Failed to initialize browser ${i}:`, error.message);
@@ -322,7 +325,7 @@ async function initializeBrowserPool() {
   performanceMetrics.browserPoolStats.availablePages = availablePages.length;
 
   Logger.info(
-    `Browser pool initialized: ${browserPool.length} browsers, ${availablePages.length} pages`
+    `Browser pool initialized: ${browserPool.length} browsers, ${availablePages.length} pages`,
   );
 }
 
@@ -383,20 +386,20 @@ async function launchOptimizedBrowser() {
 
       const browser = await puppeteer.launch(launchOptions);
       Logger.info(
-        `Optimized browser launched successfully with path: ${executablePath}`
+        `Optimized browser launched successfully with path: ${executablePath}`,
       );
       return browser;
     } catch (error) {
       Logger.error(
         `Failed to launch browser with path ${executablePath}:`,
-        error.message
+        error.message,
       );
     }
   }
 
   throw new BrowserLaunchError(
     "Failed to launch browser with all available paths",
-    null
+    null,
   );
 }
 
@@ -506,7 +509,7 @@ async function createOptimizedPage(browser) {
 
   // Set user agent to avoid bot detection
   await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
   );
 
   // Optimize page settings
@@ -528,7 +531,7 @@ async function getPageFromPool() {
 
     // Try to get a browser with available capacity
     const availableBrowser = browserPool.find(
-      (b) => b.pages.length < MAX_PAGES_PER_BROWSER
+      (b) => b.pages.length < MAX_PAGES_PER_BROWSER,
     );
     if (availableBrowser) {
       const page = await createOptimizedPage(availableBrowser.browser);
@@ -621,7 +624,7 @@ async function getRandomCars(numberOfCars, useCache = true) {
     throw new PageProcessingError(
       "Failed to fetch random cars",
       "turbo.az",
-      error
+      error,
     );
   } finally {
     if (pageInfo) {
@@ -679,7 +682,7 @@ async function getCarInfo(carUrl, retryCount = 0) {
               ?.textContent?.split(", ")[0] || "Unknown",
           year:
             document.querySelector(
-              ".product-properties__i-name[for='ad_reg_year']+span a"
+              ".product-properties__i-name[for='ad_reg_year']+span a",
             )?.textContent || "Unknown",
           mileage:
             document
@@ -688,13 +691,13 @@ async function getCarInfo(carUrl, retryCount = 0) {
           engine:
             document
               .querySelector(
-                ".product-properties__i-name[for='ad_engine_volume']"
+                ".product-properties__i-name[for='ad_engine_volume']",
               )
               ?.nextSibling?.textContent?.trim() || "Unknown",
           transmission:
             document
               .querySelector(
-                ".product-properties__i-name[for='ad_transmission']"
+                ".product-properties__i-name[for='ad_transmission']",
               )
               ?.nextSibling?.textContent?.trim() || "Unknown",
           images: [
@@ -707,7 +710,7 @@ async function getCarInfo(carUrl, retryCount = 0) {
             Number(
               document
                 .querySelector(".product-price__i")
-                ?.textContent.replace(/[^\d]/g, "")
+                ?.textContent.replace(/[^\d]/g, ""),
             ) || "Unknown",
           url: window.location.href,
         };
@@ -722,7 +725,7 @@ async function getCarInfo(carUrl, retryCount = 0) {
 
     Logger.perf(
       `Successfully fetched car info: ${carInfo.title}`,
-      Date.now() - startTime
+      Date.now() - startTime,
     );
 
     // Cache successful results
@@ -734,7 +737,7 @@ async function getCarInfo(carUrl, retryCount = 0) {
   } catch (error) {
     Logger.error(
       `Error fetching car info (attempt ${retryCount + 1}):`,
-      error.message
+      error.message,
     );
 
     if (retryCount < MAX_RETRIES) {
@@ -803,7 +806,7 @@ async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
       console.log(batch);
 
       Logger.info(
-        `Processing batch ${batchNum}/${totalBatches} (${batch.length} cars)`
+        `Processing batch ${batchNum}/${totalBatches} (${batch.length} cars)`,
       );
 
       const batchStartTime = Date.now();
@@ -812,10 +815,10 @@ async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
           Promise.race([
             getCarInfo(car),
             new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("Timeout")), 25000)
+              setTimeout(() => reject(new Error("Timeout")), 25000),
             ),
-          ])
-        )
+          ]),
+        ),
       );
 
       batchResults.forEach((result, index) => {
@@ -824,7 +827,7 @@ async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
         } else {
           Logger.error(
             `Failed to process car ${batch[index]}:`,
-            result.reason?.message
+            result.reason?.message,
           );
           carInfos.push({
             error: "Failed to fetch car details",
@@ -851,7 +854,7 @@ async function fetchCompleteCarDataCore({ number = 20, useCache = true }) {
 
     const successfulCars = carInfos.filter((car) => !car.error);
     Logger.info(
-      `Successfully processed ${successfulCars.length}/${cars.length} cars`
+      `Successfully processed ${successfulCars.length}/${cars.length} cars`,
     );
 
     if (successfulCars.length > 0) {
@@ -1163,7 +1166,7 @@ app.listen(PORT, async () => {
     // Initial cache warming
     setImmediate(() => {
       warmCache().catch((error) =>
-        Logger.error("Initial cache warming failed:", error.message)
+        Logger.error("Initial cache warming failed:", error.message),
       );
     });
 
@@ -1175,10 +1178,10 @@ app.listen(PORT, async () => {
     Logger.error("Server startup error:", error.message);
     if (error instanceof BrowserLaunchError) {
       Logger.error(
-        "⚠️  Browser launch failed. Server will continue but /get-random-cars endpoint may not work properly."
+        "⚠️  Browser launch failed. Server will continue but /get-random-cars endpoint may not work properly.",
       );
       Logger.error(
-        "Please check your Docker setup and ensure Chromium is properly installed."
+        "Please check your Docker setup and ensure Chromium is properly installed.",
       );
     }
   }
@@ -1214,11 +1217,14 @@ async function deleteDuplicateCars() {
     });
 }
 
-const cleanupScrapeInterval = setInterval(() => {
-  Logger.info("Scraping 35 cars.");
+const cleanupScrapeInterval = setInterval(
+  () => {
+    Logger.info("Scraping 35 cars.");
 
-  fetchCompleteCarDataCore({ number: 35, useCache: false });
-}, 10 * 60 * 1000); // Every 10 minutes
+    fetchCompleteCarDataCore({ number: 35, useCache: false });
+  },
+  10 * 60 * 1000,
+); // Every 10 minutes
 
 // Clear cleanup interval on shutdown
 process.on("exit", () => {
