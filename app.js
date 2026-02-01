@@ -1187,6 +1187,8 @@ app.listen(PORT, async () => {
   }
 });
 
+app.set("trust proxy", 1);
+
 async function deleteDuplicateCars() {
   carDataCollection
     .aggregate([
