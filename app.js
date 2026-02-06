@@ -629,10 +629,25 @@ async function getRandomCars(numberOfCars, useCache = true) {
   } finally {
     if (pageInfo) {
       try {
-        await pageInfo.page.isClosed();
-        returnPageToPool(pageInfo);
+        const isClosed = pageInfo.page.isClosed(); // Fixed: removed await, it's synchronous
+        if (!isClosed) {
+          returnPageToPool(pageInfo);
+        } else {
+          Logger.warn("Page was closed, creating new one");
+          // Create replacement page
+          const browser = browserPool.find((b) => b.id === pageInfo.browserId);
+          if (browser && browser.browser) {
+            const newPage = await createOptimizedPage(browser.browser);
+            availablePages.push({
+              page: newPage,
+              browserId: browser.id,
+              createdAt: Date.now(),
+              lastUsed: Date.now(),
+            });
+          }
+        }
       } catch (err) {
-        Logger.warn("Discarding invalid page, creating a fresh one...");
+        Logger.error("Error returning page to pool:", err.message);
         try {
           await pageInfo.page.close();
         } catch {}
@@ -1035,8 +1050,9 @@ app.get("/health", async (req, res) => {
 
     const memoryUsage = process.memoryUsage();
     const isHealthy =
-      memoryUsage.heapUsed < 1024 * 1024 * 1024 && // < 1GB
+      memoryUsage.heapUsed < 512 * 1024 * 1024 && // < 512MB (lowered from 1GB)
       browserPool.length > 0 &&
+      availablePages.length > 0 && // Added check for available pages
       performanceMetrics.errorCount < 100;
 
     res.status(isHealthy ? 200 : 503).json({
@@ -1220,17 +1236,83 @@ async function deleteDuplicateCars() {
 }
 
 const cleanupScrapeInterval = setInterval(
-  () => {
-    Logger.info("Scraping 35 cars.");
+  async () => {
+    try {
+      const memoryUsage = process.memoryUsage();
+      const heapUsedMB = memoryUsage.heapUsed / 1024 / 1024;
 
-    fetchCompleteCarDataCore({ number: 35, useCache: false });
+      // Only scrape if memory is healthy
+      if (
+        heapUsedMB < 512 &&
+        availablePages.length > 0 &&
+        browserPool.length > 0
+      ) {
+        Logger.info(
+          `Scraping 35 cars. Current memory: ${heapUsedMB.toFixed(2)}MB`,
+        );
+        await fetchCompleteCarDataCore({ number: 35, useCache: false });
+      } else {
+        Logger.warn(
+          `Skipping scrape - Memory: ${heapUsedMB.toFixed(2)}MB, Available pages: ${availablePages.length}, Browsers: ${browserPool.length}`,
+        );
+
+        // Force garbage collection if available
+        if (global.gc) {
+          global.gc();
+          Logger.info("Forced garbage collection");
+        }
+      }
+    } catch (error) {
+      Logger.error("Error in cleanup scrape interval:", error.message);
+    }
   },
   10 * 60 * 1000,
 ); // Every 10 minutes
+
+// Browser pool refresh to prevent memory leaks
+const browserRefreshInterval = setInterval(
+  async () => {
+    try {
+      Logger.info("Refreshing browser pool to prevent memory leaks...");
+
+      // Close old browsers
+      for (const browserInfo of browserPool) {
+        if (
+          browserInfo.browser &&
+          Date.now() - browserInfo.createdAt > 60 * 60 * 1000
+        ) {
+          // > 1 hour old
+          Logger.info(`Closing old browser ${browserInfo.id}`);
+          await browserInfo.browser.close();
+        }
+      }
+
+      // Clear pools
+      availablePages = [];
+      busyPages.clear();
+      browserPool = [];
+
+      // Reinitialize
+      await initializeBrowserPool();
+
+      Logger.info("Browser pool refreshed successfully");
+
+      // Force garbage collection
+      if (global.gc) {
+        global.gc();
+        Logger.info("Garbage collection after browser refresh");
+      }
+    } catch (error) {
+      Logger.error("Error refreshing browser pool:", error.message);
+    }
+  },
+  60 * 60 * 1000,
+); // Every hour
 
 // Clear cleanup interval on shutdown
 process.on("exit", () => {
   clearInterval(cleanupScrapeInterval);
   clearInterval(cleanupInterval);
+  clearInterval(browserRefreshInterval);
   Logger.info("Cleanup intervals cleared and server shutting down gracefully.");
 });
