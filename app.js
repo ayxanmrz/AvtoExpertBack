@@ -12,7 +12,10 @@ import { MongoClient, ServerApiVersion } from "mongodb";
 dotenv.config();
 
 const PORT = process.env.PORT || 4000;
+const ENABLE_SCRAPING = process.env.ENABLE_SCRAPING === "true";
 const app = express();
+
+console.log(`Scraping ${ENABLE_SCRAPING ? "ENABLED" : "DISABLED"}`);
 
 const MONGO_URI = process.env.MONGO_URI;
 
@@ -922,7 +925,15 @@ async function fetchCompleteCarData(req, res) {
   res.json(result);
 }
 
-app.get("/scrape-cars", fetchCompleteCarData);
+// Only enable scraping endpoint if ENABLE_SCRAPING is true
+if (ENABLE_SCRAPING) {
+  app.get("/scrape-cars", fetchCompleteCarData);
+  console.log("Scraping endpoint /scrape-cars is enabled");
+} else {
+  app.get("/scrape-cars", (req, res) => {
+    res.status(403).json({ error: "Scraping is disabled" });
+  });
+}
 
 async function fetchCarDataFromDB(numberOfCars) {
   try {
@@ -1235,39 +1246,46 @@ async function deleteDuplicateCars() {
     });
 }
 
-const cleanupScrapeInterval = setInterval(
-  async () => {
-    try {
-      const memoryUsage = process.memoryUsage();
-      const heapUsedMB = memoryUsage.heapUsed / 1024 / 1024;
+// Only start automatic scraping if ENABLE_SCRAPING is true
+let cleanupScrapeInterval;
+if (ENABLE_SCRAPING) {
+  cleanupScrapeInterval = setInterval(
+    async () => {
+      try {
+        const memoryUsage = process.memoryUsage();
+        const heapUsedMB = memoryUsage.heapUsed / 1024 / 1024;
 
-      // Only scrape if memory is healthy
-      if (
-        heapUsedMB < 512 &&
-        availablePages.length > 0 &&
-        browserPool.length > 0
-      ) {
-        Logger.info(
-          `Scraping 35 cars. Current memory: ${heapUsedMB.toFixed(2)}MB`,
-        );
-        await fetchCompleteCarDataCore({ number: 35, useCache: false });
-      } else {
-        Logger.warn(
-          `Skipping scrape - Memory: ${heapUsedMB.toFixed(2)}MB, Available pages: ${availablePages.length}, Browsers: ${browserPool.length}`,
-        );
+        // Only scrape if memory is healthy
+        if (
+          heapUsedMB < 512 &&
+          availablePages.length > 0 &&
+          browserPool.length > 0
+        ) {
+          Logger.info(
+            `Scraping 35 cars. Current memory: ${heapUsedMB.toFixed(2)}MB`,
+          );
+          await fetchCompleteCarDataCore({ number: 35, useCache: false });
+        } else {
+          Logger.warn(
+            `Skipping scrape - Memory: ${heapUsedMB.toFixed(2)}MB, Available pages: ${availablePages.length}, Browsers: ${browserPool.length}`,
+          );
 
-        // Force garbage collection if available
-        if (global.gc) {
-          global.gc();
-          Logger.info("Forced garbage collection");
+          // Force garbage collection if available
+          if (global.gc) {
+            global.gc();
+            Logger.info("Forced garbage collection");
+          }
         }
+      } catch (error) {
+        Logger.error("Error in cleanup scrape interval:", error.message);
       }
-    } catch (error) {
-      Logger.error("Error in cleanup scrape interval:", error.message);
-    }
-  },
-  10 * 60 * 1000,
-); // Every 10 minutes
+    },
+    10 * 60 * 1000,
+  ); // Every 10 minutes
+  console.log("Automatic scraping interval started");
+} else {
+  console.log("Automatic scraping interval disabled");
+}
 
 // Browser pool refresh to prevent memory leaks
 const browserRefreshInterval = setInterval(
@@ -1311,7 +1329,9 @@ const browserRefreshInterval = setInterval(
 
 // Clear cleanup interval on shutdown
 process.on("exit", () => {
-  clearInterval(cleanupScrapeInterval);
+  if (cleanupScrapeInterval) {
+    clearInterval(cleanupScrapeInterval);
+  }
   clearInterval(cleanupInterval);
   clearInterval(browserRefreshInterval);
   Logger.info("Cleanup intervals cleared and server shutting down gracefully.");
