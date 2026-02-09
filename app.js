@@ -1100,23 +1100,39 @@ app.get("/metrics", async (req, res) => {
 // Health check endpoint
 app.get("/health", async (req, res) => {
   try {
-    const browserStatus =
-      browserPool.length > 0 &&
-      browserPool[0]?.browser &&
-      !browserPool[0]?.browser.disconnected
-        ? "running"
-        : "stopped";
-
     const memoryUsage = process.memoryUsage();
-    const isHealthy =
-      memoryUsage.heapUsed < 512 * 1024 * 1024 && // < 512MB (lowered from 1GB)
-      browserPool.length > 0 &&
-      availablePages.length > 0 && // Added check for available pages
-      performanceMetrics.errorCount < 100;
+
+    // Browser status only matters if scraping is enabled
+    let browserStatus = "not-required";
+    if (ENABLE_SCRAPING) {
+      browserStatus =
+        browserPool.length > 0 &&
+        browserPool[0]?.browser &&
+        !browserPool[0]?.browser.disconnected
+          ? "running"
+          : "stopped";
+    }
+
+    // Health check logic depends on whether scraping is enabled
+    let isHealthy;
+    if (ENABLE_SCRAPING) {
+      // When scraping is enabled, check browser pool
+      isHealthy =
+        memoryUsage.heapUsed < 512 * 1024 * 1024 && // < 512MB
+        browserPool.length > 0 &&
+        availablePages.length > 0 &&
+        performanceMetrics.errorCount < 100;
+    } else {
+      // When scraping is disabled, only check memory and error count
+      isHealthy =
+        memoryUsage.heapUsed < 512 * 1024 * 1024 && // < 512MB
+        performanceMetrics.errorCount < 100;
+    }
 
     res.status(isHealthy ? 200 : 503).json({
       status: isHealthy ? "ok" : "degraded",
       timestamp: new Date().toISOString(),
+      scrapingEnabled: ENABLE_SCRAPING,
       browser: browserStatus,
       cache: {
         keys: cache.keys().length,
