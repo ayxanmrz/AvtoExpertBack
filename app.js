@@ -228,24 +228,30 @@ app.use((req, res, next) => {
 
 // Memory management
 const cleanupInterval = setInterval(
-  () => {
+  async () => {
     // Clean up old pages in the pool
     const now = Date.now();
     const maxPageAge = 10 * 60 * 1000; // 10 minutes
 
+    const pagesToRemove = [];
     availablePages = availablePages.filter((pageInfo) => {
       if (now - pageInfo.lastUsed > maxPageAge) {
-        try {
-          pageInfo.page.close();
-          Logger.info(`Closed aged page from browser ${pageInfo.browserId}`);
-          return false;
-        } catch (error) {
-          Logger.error("Error closing aged page:", error.message);
-          return false;
-        }
+        pagesToRemove.push(pageInfo);
+        return false;
       }
       return true;
     });
+
+    // Clean up and close aged pages
+    for (const pageInfo of pagesToRemove) {
+      try {
+        await cleanupPage(pageInfo.page);
+        await pageInfo.page.close();
+        Logger.info(`Closed aged page from browser ${pageInfo.browserId}`);
+      } catch (error) {
+        Logger.error("Error closing aged page:", error.message);
+      }
+    }
 
     // Update metrics
     performanceMetrics.browserPoolStats.availablePages = availablePages.length;
@@ -282,13 +288,14 @@ async function warmCache() {
   }
 }
 
-// Schedule cache warming
-const cacheWarmingInterval = setInterval(warmCache, 30 * 60 * 1000); // Every 30 minutes
-
-// Clear cache warming interval on shutdown
-process.on("exit", () => {
-  clearInterval(cacheWarmingInterval);
-});
+// Schedule cache warming - ONLY if scraping is enabled
+let cacheWarmingInterval;
+if (ENABLE_SCRAPING) {
+  cacheWarmingInterval = setInterval(warmCache, 30 * 60 * 1000); // Every 30 minutes
+  console.log("Cache warming interval started");
+} else {
+  console.log("Cache warming disabled (ENABLE_SCRAPING=false)");
+}
 
 // Enhanced browser pool management
 async function initializeBrowserPool() {
@@ -459,7 +466,8 @@ async function createOptimizedPage(browser) {
     "social",
   ]);
 
-  page.on("request", (req) => {
+  // Store the handler so we can remove it later
+  const requestHandler = (req) => {
     try {
       const resourceType = req.resourceType();
       const url = req.url().toLowerCase();
@@ -505,10 +513,12 @@ async function createOptimizedPage(browser) {
         // Request might already be handled
       }
     }
-  });
+  };
 
-  // Disable images and CSS for faster loading
-  await page.setRequestInterception(true);
+  page.on("request", requestHandler);
+
+  // Store handler reference for cleanup
+  page._customRequestHandler = requestHandler;
 
   // Set user agent to avoid bot detection
   await page.setUserAgent(
@@ -523,6 +533,34 @@ async function createOptimizedPage(browser) {
   });
 
   return page;
+}
+
+// Clean up page resources before returning to pool or closing
+async function cleanupPage(page) {
+  try {
+    if (!page || page.isClosed()) return;
+
+    // Remove custom event listener
+    if (page._customRequestHandler) {
+      page.removeListener("request", page._customRequestHandler);
+      page._customRequestHandler = null;
+    }
+
+    // Remove all other listeners to prevent memory leaks
+    page.removeAllListeners();
+
+    // Navigate to blank page to clear any residual state
+    try {
+      await page.goto("about:blank", {
+        waitUntil: "domcontentloaded",
+        timeout: 3000,
+      });
+    } catch (e) {
+      // Ignore navigation errors
+    }
+  } catch (error) {
+    Logger.error("Error cleaning up page:", error.message);
+  }
 }
 
 // Get page from pool with automatic management
@@ -564,14 +602,22 @@ async function getPageFromPool() {
   return pageInfo;
 }
 
-// Return page to pool
-function returnPageToPool(pageInfo) {
-  busyPages.delete(pageInfo);
-  pageInfo.lastUsed = Date.now();
-  availablePages.push(pageInfo);
+// Return page to pool with cleanup
+async function returnPageToPool(pageInfo) {
+  try {
+    await cleanupPage(pageInfo.page);
+    busyPages.delete(pageInfo);
+    pageInfo.lastUsed = Date.now();
+    availablePages.push(pageInfo);
 
-  performanceMetrics.browserPoolStats.availablePages = availablePages.length;
-  performanceMetrics.browserPoolStats.busyPages = busyPages.size;
+    performanceMetrics.browserPoolStats.availablePages = availablePages.length;
+    performanceMetrics.browserPoolStats.busyPages = busyPages.size;
+  } catch (error) {
+    Logger.error("Error returning page to pool:", error.message);
+    try {
+      await pageInfo.page.close();
+    } catch {}
+  }
 }
 
 // Enhanced random cars fetching with comprehensive error handling and caching
@@ -634,7 +680,7 @@ async function getRandomCars(numberOfCars, useCache = true) {
       try {
         const isClosed = pageInfo.page.isClosed(); // Fixed: removed await, it's synchronous
         if (!isClosed) {
-          returnPageToPool(pageInfo);
+          await returnPageToPool(pageInfo);
         } else {
           Logger.warn("Page was closed, creating new one");
           // Create replacement page
@@ -778,8 +824,10 @@ async function getCarInfo(carUrl, retryCount = 0) {
   } finally {
     if (pageInfo) {
       try {
-        await pageInfo.page.isClosed();
-        returnPageToPool(pageInfo);
+        const isClosed = pageInfo.page.isClosed();
+        if (!isClosed) {
+          await returnPageToPool(pageInfo);
+        }
       } catch (err) {
         Logger.warn("Discarding invalid page, creating a fresh one...");
         try {
@@ -1186,16 +1234,22 @@ app.listen(PORT, async () => {
   try {
     Logger.info(`Server starting on port ${PORT}...`);
 
-    // Initialize browser pool
-    await initializeBrowserPool();
-    Logger.info("Browser pool initialized successfully");
+    // Only initialize browser pool if scraping is enabled
+    if (ENABLE_SCRAPING) {
+      await initializeBrowserPool();
+      Logger.info("Browser pool initialized successfully");
 
-    // Initial cache warming
-    setImmediate(() => {
-      warmCache().catch((error) =>
-        Logger.error("Initial cache warming failed:", error.message),
+      // Initial cache warming
+      setImmediate(() => {
+        warmCache().catch((error) =>
+          Logger.error("Initial cache warming failed:", error.message),
+        );
+      });
+    } else {
+      Logger.info(
+        "Browser pool initialization skipped (ENABLE_SCRAPING=false)",
       );
-    });
+    }
 
     Logger.info(`[SERVER] ExpressJS is listening on http://localhost:${PORT}`);
     Logger.info("Health check available at: /health");
@@ -1287,52 +1341,77 @@ if (ENABLE_SCRAPING) {
   console.log("Automatic scraping interval disabled");
 }
 
-// Browser pool refresh to prevent memory leaks
-const browserRefreshInterval = setInterval(
-  async () => {
-    try {
-      Logger.info("Refreshing browser pool to prevent memory leaks...");
+// Browser pool refresh to prevent memory leaks - ONLY if scraping is enabled
+let browserRefreshInterval;
+if (ENABLE_SCRAPING) {
+  browserRefreshInterval = setInterval(
+    async () => {
+      try {
+        Logger.info("Refreshing browser pool to prevent memory leaks...");
 
-      // Close old browsers
-      for (const browserInfo of browserPool) {
-        if (
-          browserInfo.browser &&
-          Date.now() - browserInfo.createdAt > 60 * 60 * 1000
-        ) {
-          // > 1 hour old
-          Logger.info(`Closing old browser ${browserInfo.id}`);
-          await browserInfo.browser.close();
+        // Clean up all pages first
+        const allPages = [...availablePages, ...Array.from(busyPages)];
+        for (const pageInfo of allPages) {
+          try {
+            await cleanupPage(pageInfo.page);
+            await pageInfo.page.close();
+          } catch (error) {
+            Logger.error("Error closing page during refresh:", error.message);
+          }
         }
+
+        // Close old browsers
+        for (const browserInfo of browserPool) {
+          if (browserInfo.browser) {
+            try {
+              await browserInfo.browser.close();
+              Logger.info(`Closed browser ${browserInfo.id}`);
+            } catch (error) {
+              Logger.error(
+                `Error closing browser ${browserInfo.id}:`,
+                error.message,
+              );
+            }
+          }
+        }
+
+        // Clear pools
+        availablePages = [];
+        busyPages.clear();
+        browserPool = [];
+
+        // Reinitialize
+        await initializeBrowserPool();
+
+        Logger.info("Browser pool refreshed successfully");
+
+        // Force garbage collection
+        if (global.gc) {
+          global.gc();
+          Logger.info("Garbage collection after browser refresh");
+        }
+      } catch (error) {
+        Logger.error("Error refreshing browser pool:", error.message);
       }
-
-      // Clear pools
-      availablePages = [];
-      busyPages.clear();
-      browserPool = [];
-
-      // Reinitialize
-      await initializeBrowserPool();
-
-      Logger.info("Browser pool refreshed successfully");
-
-      // Force garbage collection
-      if (global.gc) {
-        global.gc();
-        Logger.info("Garbage collection after browser refresh");
-      }
-    } catch (error) {
-      Logger.error("Error refreshing browser pool:", error.message);
-    }
-  },
-  60 * 60 * 1000,
-); // Every hour
+    },
+    60 * 60 * 1000,
+  ); // Every hour
+  console.log("Browser refresh interval started");
+} else {
+  console.log("Browser refresh disabled (ENABLE_SCRAPING=false)");
+}
 
 // Clear cleanup interval on shutdown
 process.on("exit", () => {
   if (cleanupScrapeInterval) {
     clearInterval(cleanupScrapeInterval);
   }
+  if (cacheWarmingInterval) {
+    clearInterval(cacheWarmingInterval);
+  }
+  if (browserRefreshInterval) {
+    clearInterval(browserRefreshInterval);
+  }
   clearInterval(cleanupInterval);
-  clearInterval(browserRefreshInterval);
   Logger.info("Cleanup intervals cleared and server shutting down gracefully.");
 });
